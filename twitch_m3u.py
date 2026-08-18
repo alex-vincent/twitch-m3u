@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import datetime as dt
+import hmac
 import json
 import os
 import random
@@ -685,10 +686,12 @@ def _extinf(meta: dict, group_title: str) -> str:
             f'tvg-logo="{meta["logo"]}" group-title="{group_title}",{name}')
 
 
-def playlist_from_meta(metas: list[dict], *, direct: bool, host: str,
-                       port: int, quality: str, proxy: bool = False,
-                       epg_url: str = "") -> str:
+def playlist_from_meta(metas: list[dict], *, direct: bool, quality: str,
+                       base: str = "", host: str = "", port: int = 0,
+                       proxy: bool = False, epg_url: str = "",
+                       key: str = "") -> str:
     """Render already-fetched channel metadata as an M3U."""
+    base = base or f"http://{host or '127.0.0.1'}:{port or 7777}"
     lines = [f'#EXTM3U x-tvg-url="{epg_url}"']
     for meta in metas:
         if direct:
@@ -701,8 +704,10 @@ def playlist_from_meta(metas: list[dict], *, direct: bool, host: str,
                 continue
         else:
             route = "hls" if proxy else "live"
-            url = (f"http://{host}:{port}/{route}/{meta['login']}.m3u8"
+            url = (f"{base}/{route}/{meta['login']}.m3u8"
                    f"?q={urllib.parse.quote(quality)}")
+            if key:
+                url += f"&key={urllib.parse.quote(key)}"
         lines.append(_extinf(meta, meta.get("group") or "Twitch"))
         lines.append(url)
     return "\n".join(lines) + "\n"
@@ -772,6 +777,7 @@ class Handler(BaseHTTPRequestHandler):
     channels_path = CHANNELS_FILE
     default_quality = "best"
     proxy_default = True      # playlists point at /hls (ad-stall-proof)
+    access_key = ""           # when set, every endpoint requires ?key=
 
     def log_message(self, fmt, *a):     # one tidy line per request
         sys.stderr.write("  %s\n" % (fmt % a))
@@ -782,6 +788,12 @@ class Handler(BaseHTTPRequestHandler):
         quality = (qs.get("q") or qs.get("quality")
                    or [self.default_quality])[0]
         path = u.path
+
+        if self.access_key:
+            supplied = (qs.get("key") or [""])[0]
+            if not hmac.compare_digest(supplied, self.access_key):
+                self.send_error(403, "missing or bad ?key=")
+                return
 
         try:
             # A player pointed at the bare host must get a playlist, not prose:
@@ -925,7 +937,6 @@ class Handler(BaseHTTPRequestHandler):
         return self._dedupe(metas + self._discovered(qs))
 
     def _epg_url(self, path: str, qs: dict) -> str:
-        host = self.headers.get("Host") or "127.0.0.1"
         src = "playlist"
         if path.startswith("/top"):
             src = "top"
@@ -936,7 +947,9 @@ class Handler(BaseHTTPRequestHandler):
                 re.sub(r"^/game/|\.m3u8?$", "", path))
         params = {k: v[0] for k, v in qs.items() if k != "q"}
         params["src"] = src                      # quoted exactly once
-        return f"http://{host}/epg.xml?" + urllib.parse.urlencode(params)
+        if self.access_key:
+            params["key"] = self.access_key
+        return f"{self.base_url()}/epg.xml?" + urllib.parse.urlencode(params)
 
     def _discovered(self, qs: dict) -> list[dict]:
         """Optional ?top= / ?games= / ?per= discovery mixed into a playlist."""
@@ -958,13 +971,27 @@ class Handler(BaseHTTPRequestHandler):
                 out.append(m)
         return out
 
+    def base_url(self) -> str:
+        """Public origin of this request.
+
+        Behind a TLS reverse proxy the scheme is https and Host carries no
+        port; emitting http://host:7777 there produces a playlist full of
+        unreachable URLs.
+        """
+        proto = (self.headers.get("X-Forwarded-Proto") or "").split(",")[0]
+        host = (self.headers.get("X-Forwarded-Host")
+                or self.headers.get("Host") or "")
+        host = host.split(",")[0].strip()
+        if not host:
+            host = f"127.0.0.1:{self.server.server_address[1]}"
+        elif ":" not in host and not proto:
+            host = f"{host}:{self.server.server_address[1]}"
+        return f"{proto or 'http'}://{host}"
+
     def _m3u(self, metas: list[dict], quality: str, epg_url: str = ""):
-        host, _, hport = (self.headers.get("Host") or "").partition(":")
         body = playlist_from_meta(
-            metas, direct=False, host=host or "127.0.0.1",
-            port=int(hport) if hport.isdigit()
-                 else self.server.server_address[1],
-            quality=quality, proxy=self.proxy_default, epg_url=epg_url)
+            metas, direct=False, base=self.base_url(), quality=quality,
+            proxy=self.proxy_default, epg_url=epg_url, key=self.access_key)
         return self._text(body, "application/vnd.apple.mpegurl")
 
     def _text(self, body: str, ctype: str = "text/plain; charset=utf-8"):
@@ -1001,10 +1028,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int, quality: str, channels_path: str,
-          refresh: float = 900.0) -> None:
+          refresh: float = 900.0, key: str = "") -> None:
     global DISCOVER_TTL
     Handler.default_quality = quality
     Handler.channels_path = channels_path
+    Handler.access_key = key or os.environ.get("TWITCH_M3U_KEY", "").strip()
     if refresh:
         DISCOVER_TTL = max(DISCOVER_TTL, refresh * 3)   # refresher keeps it hot
     ThreadingHTTPServer.allow_reuse_address = True   # survive quick restarts
@@ -1029,6 +1057,8 @@ def serve(host: str, port: int, quality: str, channels_path: str,
           f"  channels: {channels_path}\n"
           + (f"  refresh:  every {refresh / 60:.0f} min\n" if refresh
              else "  refresh:  off\n")
+          + ("  access:   ?key= required\n" if Handler.access_key
+             else "  access:   OPEN — anyone who can reach this can use it\n")
           + "Ctrl-C to stop.")
     try:
         httpd.serve_forever()
@@ -1058,6 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("-q", "--quality", default="best")
     p.add_argument("-c", "--channels", default=CHANNELS_FILE)
+    p.add_argument("--key", default="", metavar="SECRET",
+                   help="require ?key=SECRET on every request "
+                        "(or set TWITCH_M3U_KEY)")
     p.add_argument("--refresh", type=float, default=900, metavar="SECONDS",
                    help="rescan in the background this often (0 = off, "
                         "default 900 = 15 min)")
@@ -1132,7 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if a.cmd == "serve":
-        serve(a.host, a.port, a.quality, a.channels, a.refresh)
+        serve(a.host, a.port, a.quality, a.channels, a.refresh, a.key)
         return 0
 
     if a.cmd == "build":
