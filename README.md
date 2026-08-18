@@ -237,6 +237,26 @@ shorter `--refresh` than your app's own interval just burns API calls.
 A deep scan is ~3,400 requests. At `--refresh 300` with `deep=1` that is a lot
 of traffic every five minutes — pair deep scans with a longer interval.
 
+## Sort order
+
+Twitch returns category listings in its own "recommended" order, which is not
+by audience — a category can hand back a 170-viewer stream ahead of a
+1,000-viewer one, so an unsorted playlist looks shuffled.
+
+Everything is sorted by viewer count, highest first, by default. Because the
+sort is applied across the whole list, each category group is internally
+descending too.
+
+```
+?sort=viewers   biggest audience first (default)
+?sort=asc       smallest first — handy for finding tiny streams
+?sort=name      alphabetical
+?sort=none      Twitch's own order
+```
+
+Also `--sort` on `build`. Channels from your own `channels.txt` keep the order
+you wrote them in; only discovered channels are sorted.
+
 ## Quality
 
 `-q` on any command, or `?q=` on any server URL:

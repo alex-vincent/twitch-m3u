@@ -526,9 +526,24 @@ def refresh_loop(interval: float, stop: threading.Event) -> None:
                       file=sys.stderr)
 
 
+def sort_metas(metas: list[dict], how: str = "viewers") -> list[dict]:
+    """Twitch returns categories in its own 'recommended' order, not by
+    audience, so a playlist looks shuffled unless we sort it ourselves."""
+    how = (how or "viewers").lower()
+    if how in ("none", "off", "api"):
+        return metas
+    if how in ("name", "alpha"):
+        return sorted(metas, key=lambda m: m["display"].lower())
+    if how in ("asc", "viewers_asc", "smallest"):
+        return sorted(metas, key=lambda m: (m.get("viewers") or 0))
+    # default: biggest audience first, ties broken by name for stability
+    return sorted(metas, key=lambda m: (-(m.get("viewers") or 0),
+                                        m["display"].lower()))
+
+
 def discover(games: int = 0, per_game: int = 20, top: int = 30,
              language: str = "", deep: bool = False, workers: int = 8,
-             progress: bool = False) -> list[dict]:
+             progress: bool = False, sort: str = "viewers") -> list[dict]:
     """Top streams plus the streams of many categories, fetched in parallel."""
     seen: set[str] = set()
     out: list[dict] = []
@@ -558,7 +573,7 @@ def discover(games: int = 0, per_game: int = 20, top: int = 30,
                 if progress and done % 25 == 0:
                     print(f"  {done}/{len(cats)} categories, "
                           f"{len(out)} channels", file=sys.stderr)
-    return out
+    return sort_metas(out, sort)
 
 
 # ------------------------------------------------------------------------ epg
@@ -801,7 +816,9 @@ class Handler(BaseHTTPRequestHandler):
                                     (qs.get("lang") or [""])[0])
                 for meta in metas:
                     meta["group"] = "Top Live"
-                return self._m3u(metas, quality, self._epg_url(path, qs))
+                return self._m3u(sort_metas(metas, (qs.get("sort")
+                                 or ["viewers"])[0]), quality,
+                                 self._epg_url(path, qs))
 
             if path in ("/games.m3u8", "/games.m3u", "/games", "/all.m3u8"):
                 return self._m3u(discover_cached(
@@ -809,7 +826,8 @@ class Handler(BaseHTTPRequestHandler):
                     top=_int(qs, "top", 30),
                     language=(qs.get("lang") or [""])[0],
                     deep=_flag(qs, "deep"),
-                    workers=_int(qs, "workers", 8)), quality,
+                    workers=_int(qs, "workers", 8),
+                    sort=(qs.get("sort") or ["viewers"])[0]), quality,
                     self._epg_url(path, qs))
 
             m = re.fullmatch(r"/game/(.+?)(?:\.m3u8?)?", path)
@@ -818,7 +836,9 @@ class Handler(BaseHTTPRequestHandler):
                 metas = game_streams(name, _int(qs, "n", 100))
                 for meta in metas:
                     meta["group"] = name
-                return self._m3u(metas, quality, self._epg_url(path, qs))
+                return self._m3u(sort_metas(metas, (qs.get("sort")
+                                 or ["viewers"])[0]), quality,
+                                 self._epg_url(path, qs))
 
             m = re.fullmatch(r"/hls/([A-Za-z0-9_]{2,30})(?:\.m3u8?)?", path)
             if m:
@@ -873,25 +893,27 @@ class Handler(BaseHTTPRequestHandler):
 
     def _channel_set(self, path: str, qs: dict) -> list[dict]:
         """The exact channels a given playlist path represents."""
+        how = (qs.get("sort") or ["viewers"])[0]
         if path.startswith("/top"):
             metas = top_streams(_int(qs, "n", 30),
                                 (qs.get("lang") or [""])[0])
             for m in metas:
                 m["group"] = "Top Live"
-            return metas
+            return sort_metas(metas, how)
         if path.startswith("/game/"):
             name = urllib.parse.unquote(
                 re.sub(r"^/game/|\.m3u8?$|\.xml$", "", path))
             metas = game_streams(name, _int(qs, "n", 100))
             for m in metas:
                 m["group"] = name
-            return metas
+            return sort_metas(metas, how)
         if path.startswith("/games") or path.startswith("/all"):
             return discover_cached(
                 games=_int(qs, "games", 100), per_game=_int(qs, "per", 100),
                 top=_int(qs, "top", 30),
                 language=(qs.get("lang") or [""])[0],
-                deep=_flag(qs, "deep"), workers=_int(qs, "workers", 8))
+                deep=_flag(qs, "deep"), workers=_int(qs, "workers", 8),
+                sort=how)
         metas = []
         if _flag(qs, "mine", default=True):
             chans = read_channels(self.channels_path)
@@ -899,6 +921,7 @@ class Handler(BaseHTTPRequestHandler):
             want_all = _flag(qs, "all", default=False)
             metas = [dict(info[c], group="Twitch") for c in chans
                      if want_all or info[c]["live"]]
+        # channels.txt keeps its hand-written order; discovery gets sorted
         return self._dedupe(metas + self._discovered(qs))
 
     def _epg_url(self, path: str, qs: dict) -> str:
@@ -920,10 +943,11 @@ class Handler(BaseHTTPRequestHandler):
         games, top = _int(qs, "games", 0), _int(qs, "top", 0)
         if not games and not top:
             return []
-        return discover(games=games, per_game=_int(qs, "per", 100), top=top,
-                        language=(qs.get("lang") or [""])[0],
-                        deep=_flag(qs, "deep"),
-                        workers=_int(qs, "workers", 8))
+        return discover_cached(
+            games=games, per_game=_int(qs, "per", 100), top=top,
+            language=(qs.get("lang") or [""])[0], deep=_flag(qs, "deep"),
+            workers=_int(qs, "workers", 8),
+            sort=(qs.get("sort") or ["viewers"])[0])
 
     @staticmethod
     def _dedupe(metas: list[dict]) -> list[dict]:
@@ -1063,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--deep", action="store_true",
                    help="widen past 100 categories by searching the alphabet")
     p.add_argument("--workers", type=int, default=8, metavar="N")
+    p.add_argument("--sort", default="viewers",
+                   choices=["viewers", "asc", "name", "none"],
+                   help="channel order (default viewers, highest first)")
 
     p = sub.add_parser("discover", help="browse what is live right now")
     p.add_argument("--top", type=int, default=30, metavar="N")
@@ -1119,7 +1146,7 @@ def main(argv: list[str] | None = None) -> int:
         if a.top or a.games:
             metas += discover(games=a.games, per_game=a.per, top=a.top,
                               language=a.lang, deep=a.deep,
-                              workers=a.workers, progress=True)
+                              workers=a.workers, progress=True, sort=a.sort)
         seen, uniq = set(), []
         for m in metas:
             if m["login"] not in seen:
@@ -1139,7 +1166,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.cmd == "discover":
         if a.game:
-            metas = game_streams(a.game, a.per or 30)
+            metas = sort_metas(game_streams(a.game, a.per or 30))
             for m in metas:
                 m["group"] = a.game
         else:
