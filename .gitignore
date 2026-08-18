@@ -3,3 +3,5 @@ twitch-direct.m3u
 __pycache__/
 
 .DS_Store
+twitch-full.m3u
+twitch-full-epg.xml
