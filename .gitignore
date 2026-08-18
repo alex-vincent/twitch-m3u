@@ -1,0 +1,5 @@
+twitch.m3u
+twitch-direct.m3u
+__pycache__/
+
+.DS_Store

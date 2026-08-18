@@ -1,0 +1,9 @@
+# One Twitch channel per line. Bare logins or full twitch.tv URLs both work.
+# Lines starting with # are ignored. Edit freely, then re-run `build`/`status`.
+
+loltyler1
+xqc
+shroud
+pokimane
+caedrel
+https://www.twitch.tv/gmhikaru
