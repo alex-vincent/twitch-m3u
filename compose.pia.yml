@@ -14,7 +14,7 @@ services:
       FIREWALL: "on"
       FIREWALL_INPUT_PORTS: "7777"
     ports:
-      - "127.0.0.1:${TWITCH_M3U_PORT:-7777}:7777"
+      - "${TWITCH_M3U_BIND_IP:-127.0.0.1}:${TWITCH_M3U_PORT:-7777}:7777"
     restart: unless-stopped
   twitch-m3u:
     build: .

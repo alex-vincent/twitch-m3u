@@ -101,7 +101,12 @@ docker compose -f compose.pia.yml up -d --force-recreate
 docker compose -f compose.pia.yml ps
 ```
 
-Keep the existing host Caddy configuration:
+On the current Oracle deployment Caddy is containerized and uses
+`reverse_proxy 172.19.0.1:7777`. Set `TWITCH_M3U_BIND_IP=172.19.0.1` on Oracle
+before cutover to preserve that upstream. For local tests and Caddy running
+directly on the host, leave `TWITCH_M3U_BIND_IP=127.0.0.1`.
+
+For host-installed Caddy the configuration is:
 
 ```caddyfile
 twitch.vincentserver.com {
@@ -109,7 +114,8 @@ twitch.vincentserver.com {
 }
 ```
 
-No new public port is needed. Compose publishes only to host loopback. Test your
+No new public port is needed. Compose publishes to the configured host IP
+(loopback by default, the Docker bridge for the current Oracle Caddy). Test your
 usual HTTPS playlist from a phone on cellular, and verify playback and the EPG.
 Once successful, disable the old service so it does not compete for the port
 after a reboot:
