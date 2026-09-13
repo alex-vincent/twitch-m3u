@@ -1,5 +1,6 @@
 import contextlib
 import io
+import http.client
 import threading
 import unittest
 import urllib.error
@@ -21,6 +22,45 @@ class Response(io.BytesIO):
 
 
 class ProxyTests(unittest.TestCase):
+    def test_variants_with_relative_urls_crlf_and_reordered_attributes(self):
+        body = ('#EXTM3U\r\n'
+                '#EXT-X-MEDIA:NAME="720p, HD",TYPE=VIDEO,GROUP-ID="720p"\r\n'
+                '#EXT-X-STREAM-INF:CODECS="avc1,mp4a",VIDEO="720p",BANDWIDTH=1000,RESOLUTION=1280x720\r\n'
+                '# a comment\r\n\r\n../video/720.m3u8?token=x\r\n'
+                '#EXT-X-STREAM-INF:VIDEO="audio_only",BANDWIDTH=100\r\n'
+                '//audio.ttvnw.net/audio.m3u8\r\n')
+        base = 'https://video.ttvnw.net/live/master.m3u8'
+        parsed = app.variants(body, base)
+        self.assertEqual(parsed[0]['name'], '720p, HD')
+        self.assertEqual(parsed[0]['url'], 'https://video.ttvnw.net/video/720.m3u8?token=x')
+        self.assertEqual(app.pick_variant(body, '720', base), parsed[0]['url'])
+        self.assertEqual(app.pick_variant(body, 'audio', base), 'https://audio.ttvnw.net/audio.m3u8')
+
+    def test_resolve_uses_final_master_location(self):
+        body = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nvideo.m3u8\n'
+        with patch.object(app, 'master_playlist', return_value=('https://a.ttvnw.net/redirect/master.m3u8', body)):
+            self.assertEqual(app.resolve('test'), 'https://a.ttvnw.net/redirect/video.m3u8')
+
+    def test_manifest_decoding_rejects_invalid_or_oversized_responses(self):
+        self.assertEqual(app.decode_manifest(b'\xef\xbb\xbf#EXTM3U\r\n'), '#EXTM3U\n')
+        for data in (b'<html>error</html>', b'#EXTM3U-not-a-header\n', b'#EXTM3U\n\xff'):
+            with self.subTest(data=data), self.assertRaises(app.TwitchError):
+                app.decode_manifest(data)
+        with patch.object(app, 'MAX_MANIFEST_BYTES', 7), self.assertRaises(app.TwitchError):
+            app.decode_manifest(b'#EXTM3U\n')
+
+    def test_url_rewriting_preserves_quoted_commas_and_custom_attributes(self):
+        body = '#EXTM3U\n#EXT-X-MEDIA:NAME="audio, commentary",X-URI="keep",URI="audio.m3u8?x=a,b"\n'
+        result = app.rewrite_media_urls(body, 'https://a.ttvnw.net/live/index.m3u8', lambda u: 'local?u=' + urllib.parse.quote(u, safe=''))
+        self.assertIn('NAME="audio, commentary",X-URI="keep",URI="local?', result)
+        self.assertIn('audio.m3u8%3Fx%3Da%2Cb', result)
+
+    def test_gql_does_not_inherit_environment_proxy(self):
+        with patch.object(app.urllib.request, 'build_opener') as build:
+            build.return_value.open.return_value = Response(b'{"data":{}}', app.GQL_URL)
+            self.assertEqual(app._post_gql({'query': 'test'}), {'data': {}})
+            self.assertEqual(build.call_args.args[0].proxies, {})
+
     def test_all_hls_references(self):
         source = '''#EXTM3U
 #EXT-X-MEDIA:TYPE=AUDIO,URI="audio.m3u8"
@@ -140,9 +180,108 @@ class HTTPTests(unittest.TestCase):
         with patch.object(app, 'resolve', return_value='https://video.ttvnw.net/a?secret=hidden'), patch.object(app, 'open_media', side_effect=OSError('secret=hidden')):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 self.get('/hls/test.m3u8?key=test-key')
-            self.assertEqual(ctx.exception.code, 502)
+            self.assertEqual(ctx.exception.code, 503)
+            self.assertEqual(ctx.exception.headers['Retry-After'], '3')
             self.assertNotIn(b'hidden', ctx.exception.read())
             self.assertIsNone(ctx.exception.headers.get('Location'))
+
+    def test_stale_vpn_session_refreshes_once_and_preserves_sequence(self):
+        old = 'https://a.ttvnw.net/live.m3u8?old=token'
+        new = 'https://b.ttvnw.net/live.m3u8?new=token'
+        body = b'#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:90\n#EXTINF:6,\nhttps://a.ttvnw.net/one.ts\n'
+        app._NORMALISERS.clear()
+        with patch.object(app, 'resolve', side_effect=[old, new]) as resolve, patch.object(app, 'open_media', side_effect=[
+            Response(body, old),
+            urllib.error.HTTPError(old, 403, 'expired', {}, None),
+            Response(body.replace(b'one.ts', b'two.ts'), new),
+        ]) as fetch:
+            with self.get('/hls/test.m3u8?key=test-key') as r:
+                self.assertIn('MEDIA-SEQUENCE:0', r.read().decode())
+            with self.get('/hls/test.m3u8?key=test-key') as r:
+                self.assertIn('MEDIA-SEQUENCE:1', r.read().decode())
+            self.assertEqual(resolve.call_count, 2)
+            self.assertEqual(fetch.call_count, 3)
+
+    def test_transient_vpn_failure_does_not_refresh_tokens(self):
+        url = 'https://a.ttvnw.net/live.m3u8'
+        with patch.object(app, 'resolve', return_value=url) as resolve, patch.object(app, 'open_media', side_effect=urllib.error.HTTPError(url, 503, 'unavailable', {}, None)) as fetch:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.get('/hls/test.m3u8?key=test-key')
+            self.assertEqual(ctx.exception.code, 503)
+            self.assertEqual(ctx.exception.headers['Retry-After'], '3')
+            self.assertEqual(resolve.call_count, 1)
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_root_rejects_html_with_success_status(self):
+        url = 'https://a.ttvnw.net/extensionless'
+        with patch.object(app, 'resolve', return_value=url), patch.object(app, 'open_media', return_value=Response(b'<html>VPN gateway error</html>', url)):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.get('/hls/test.m3u8?key=test-key')
+            self.assertEqual(ctx.exception.code, 502)
+            self.assertNotIn(b'VPN gateway', ctx.exception.read())
+
+    def test_nested_bom_manifest_and_forwarded_origin(self):
+        url = 'https://a.ttvnw.net/manifest'
+        body = b'\xef\xbb\xbf#EXTM3U\r\n#EXT-X-MAP:URI="init.mp4"\r\n#EXTINF:6,\r\nsegment.ts\r\n'
+        with patch.object(app, 'open_media', return_value=Response(body, 'https://b.ttvnw.net/final/master.m3u8')):
+            with self.get(self.media_path(url), headers={'X-Forwarded-Proto': 'https', 'X-Forwarded-Host': 'player.example'}) as r:
+                result = r.read().decode()
+            self.assertTrue(result.startswith('#EXTM3U\n'))
+            segment = result.splitlines()[-1]
+            self.assertTrue(segment.startswith('https://player.example/media?'))
+            qs = urllib.parse.parse_qs(urllib.parse.urlsplit(segment).query)
+            self.assertEqual(qs['url'], ['https://b.ttvnw.net/final/segment.ts'])
+
+    def test_range_failure_preserves_content_range(self):
+        url = 'https://a.ttvnw.net/seg.mp4'
+        error = urllib.error.HTTPError(url, 416, 'range', {'Content-Range': 'bytes */10'}, None)
+        with patch.object(app, 'open_media', side_effect=error):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.get(self.media_path(url), headers={'Range': 'bytes=20-'})
+            self.assertEqual(ctx.exception.code, 416)
+            self.assertEqual(ctx.exception.headers['Content-Range'], 'bytes */10')
+            self.assertEqual(ctx.exception.read(), b'')
+
+    def test_mid_segment_disconnect_does_not_append_error_document(self):
+        class Interrupted(Response):
+            def read(self, size=-1):
+                if self.tell():
+                    raise http.client.IncompleteRead(b'private upstream detail', 100)
+                return super().read(size)
+        url = 'https://a.ttvnw.net/segment.ts'
+        response = Interrupted(b'x' * 100000, url, headers={'Content-Length': '100000'})
+        with patch.object(app, 'open_media', return_value=response):
+            with self.get(self.media_path(url)) as r:
+                with self.assertRaises(http.client.IncompleteRead) as ctx:
+                    r.read()
+                self.assertEqual(ctx.exception.partial, b'x' * (64 * 1024))
+
+    def test_if_range_forwarded_for_segments_but_not_manifests(self):
+        segment = 'https://a.ttvnw.net/segment.ts'
+        with patch.object(app, 'open_media', return_value=Response(b'data', segment)) as fetch:
+            with self.get(self.media_path(segment), headers={'Range': 'bytes=0-3', 'If-Range': '"etag"'}) as r:
+                r.read()
+            self.assertEqual(fetch.call_args.args[1], {'Range': 'bytes=0-3', 'If-Range': '"etag"'})
+        manifest = 'https://a.ttvnw.net/master.m3u8'
+        with patch.object(app, 'open_media', return_value=Response(b'#EXTM3U\n', manifest)) as fetch:
+            with self.get(self.media_path(manifest), headers={'Range': 'bytes=0-3', 'If-Range': '"etag"'}) as r:
+                self.assertEqual(r.read(), b'#EXTM3U\n')
+            self.assertEqual(fetch.call_args.args[1], {})
+
+    def test_byte_range_manifest_sequence_is_preserved(self):
+        url = 'https://a.ttvnw.net/live.m3u8'
+        body = b'#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:19\n#EXTINF:6,\n#EXT-X-BYTERANGE:10@0\nseg.mp4\n#EXTINF:6,\n#EXT-X-BYTERANGE:10\nseg.mp4\n'
+        with patch.object(app, 'open_media', return_value=Response(body, url)):
+            with self.get(self.media_path(url)) as r:
+                result = r.read().decode()
+                self.assertIn('MEDIA-SEQUENCE:19', result)
+                self.assertIn('#EXT-X-BYTERANGE:10\n', result)
+
+    def test_non_ascii_credentials_return_forbidden(self):
+        for path in ('/help?key=%C3%A9', '/media?key=test-key&sig=%C3%A9'):
+            with self.subTest(path=path), self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.get(path)
+            self.assertEqual(ctx.exception.code, 403)
 
     def test_query_secrets_are_redacted(self):
         output = io.StringIO()

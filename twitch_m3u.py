@@ -30,6 +30,7 @@ import concurrent.futures as cf
 import datetime as dt
 import hashlib
 import hmac
+import http.client
 import json
 import os
 import random
@@ -85,14 +86,15 @@ def _post_gql(payload: dict, timeout: float = 10.0) -> dict:
         headers["Authorization"] = "OAuth " + auth.removeprefix("oauth:")
     req = urllib.request.Request(
         GQL_URL, data=json.dumps(payload).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    # Use the same OS/VPN route as media requests, even if the parent shell
+    # exports HTTP(S)_PROXY. Otherwise tokens can be minted from another IP.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 
 def _get(url: str, timeout: float = 10.0) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    return fetch_manifest(url, timeout)[1]
 
 
 # Only the server can mint proxy links; clients cannot supply arbitrary targets.
@@ -115,12 +117,45 @@ class _MediaRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_media(url: str, headers: dict | None = None):
+def open_media(url: str, headers: dict | None = None, timeout: float = 20):
     validate_media_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
     # No inherited HTTP proxy: the VPN network namespace provides the route.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _MediaRedirect())
-    return opener.open(req, timeout=20)
+    return opener.open(req, timeout=timeout)
+
+
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_HLS_TYPES = {"application/vnd.apple.mpegurl", "application/x-mpegurl",
+              "audio/mpegurl", "audio/x-mpegurl"}
+
+
+def decode_manifest(raw: bytes) -> str:
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise TwitchError("upstream manifest too large")
+    # Tolerate a BOM and leading whitespace seen in intermediary responses,
+    # then emit the canonical header and LF newlines for players.
+    try:
+        body = raw.decode("utf-8-sig").lstrip()
+    except UnicodeDecodeError:
+        raise TwitchError("invalid upstream manifest encoding") from None
+    if not body.splitlines() or body.splitlines()[0] != "#EXTM3U":
+        raise TwitchError("upstream returned no HLS manifest")
+    return "\n".join(body.splitlines()) + "\n"
+
+
+def fetch_manifest(url: str, timeout: float = 10) -> tuple[str, str]:
+    with open_media(url, timeout=timeout) as response:
+        return response.geturl(), decode_manifest(response.read(MAX_MANIFEST_BYTES + 1))
+
+
+# Attribute values may contain commas inside quotes. Keep their original
+# spans so URL rewriting does not alter unrelated attributes or tag values.
+_ATTRIBUTE = re.compile(r'([A-Z0-9-]+)=("[^"\r\n]*"|[^,\r\n]*)(?:,|$)')
+
+
+def hls_attributes(text: str) -> dict[str, str]:
+    return {m.group(1): m.group(2).strip('"') for m in _ATTRIBUTE.finditer(text)}
 
 
 def proxy_signature(url: str) -> str:
@@ -132,12 +167,21 @@ def rewrite_media_urls(body: str, upstream: str, link) -> str:
     def local(uri):
         return link(validate_media_url(urllib.parse.urljoin(upstream, uri)))
     lines = []
-    for line in body.splitlines():
+    for line in body.lstrip("\ufeff").splitlines():
+        line = line.strip()
         if line and not line.startswith("#"):
             line = local(line.strip())
-        elif line.startswith("#EXT"):
-            line = re.sub(r'(?<![A-Z-])URI="([^"\n]+)"',
-                          lambda m: 'URI="' + local(m.group(1)) + '"', line)
+        elif line.startswith("#EXT-X-") and ":" in line:
+            tag, attrs = line.split(":", 1)
+            def replace(m):
+                if m.group(1) != "URI":
+                    return m.group(0)
+                value = m.group(2)
+                if not value.startswith('"') or not value.endswith('"'):
+                    raise TwitchError("unquoted HLS URI attribute")
+                return 'URI="' + local(value[1:-1]) + '"' + (
+                    "," if m.group(0).endswith(",") else "")
+            line = tag + ":" + _ATTRIBUTE.sub(replace, attrs)
         lines.append(line)
     return "\n".join(lines) + "\n"
 
@@ -214,7 +258,7 @@ def master_playlist(channel: str = "", vod_id: str = "") -> tuple[str, str]:
             else USHER_LIVE.format(channel=channel.lower()))
     url = _usher(base, token, sig, session_key=(vod_id or channel).lower())
     try:
-        body = _get(url)
+        url, body = fetch_manifest(url)
     except urllib.error.HTTPError as e:
         if e.code in (403, 404):
             raise Offline(f"{vod_id or channel} is offline or unavailable")
@@ -224,33 +268,45 @@ def master_playlist(channel: str = "", vod_id: str = "") -> tuple[str, str]:
     return url, body
 
 
-_VARIANT = re.compile(
-    r'#EXT-X-STREAM-INF:(?P<attrs>[^\n]*)\n(?P<url>https?://[^\s]+)')
-
-
-def variants(master_body: str) -> list[dict]:
+def variants(master_body: str, base_url: str = "") -> list[dict]:
     """Parse a master playlist into [{name, group, resolution, url, ...}]."""
-    groups = dict(re.findall(
-        r'#EXT-X-MEDIA:[^\n]*GROUP-ID="([^"]+)"[^\n]*NAME="([^"]+)"',
-        master_body))
+    lines = [line.strip() for line in master_body.lstrip("\ufeff").splitlines()]
+    groups = {}
+    for line in lines:
+        if line.startswith("#EXT-X-MEDIA:"):
+            attrs = hls_attributes(line.split(":", 1)[1])
+            groups[attrs.get("GROUP-ID", "")] = attrs.get("NAME", "")
     out = []
-    for m in _VARIANT.finditer(master_body):
-        attrs = dict(re.findall(r'([A-Z-]+)=("[^"]*"|[^,]*)', m.group("attrs")))
-        group = attrs.get("VIDEO", "").strip('"')
+    attrs = None
+    for line in lines:
+        if line.startswith("#EXT-X-STREAM-INF:"):
+            attrs = hls_attributes(line.split(":", 1)[1])
+            continue
+        if not line or line.startswith("#") or attrs is None:
+            continue
+        resolution = attrs.get("RESOLUTION", "")
+        if not re.fullmatch(r"[1-9]\d*x[1-9]\d*", resolution):
+            resolution = ""
+        group = attrs.get("VIDEO", "") or (attrs.get("AUDIO", "") if not resolution else "")
+        try:
+            bandwidth = max(0, int(attrs.get("BANDWIDTH", "0")))
+        except ValueError:
+            bandwidth = 0
         out.append({
             "group": group,
             "name": groups.get(group, group),
-            "resolution": attrs.get("RESOLUTION", ""),
-            "bandwidth": int(attrs.get("BANDWIDTH", "0") or 0),
+            "resolution": resolution,
+            "bandwidth": bandwidth,
             "framerate": attrs.get("FRAME-RATE", ""),
-            "url": m.group("url"),
+            "url": urllib.parse.urljoin(base_url, line),
         })
+        attrs = None
     return out
 
 
-def pick_variant(master_body: str, quality: str) -> str | None:
+def pick_variant(master_body: str, quality: str, base_url: str = "") -> str | None:
     """quality: best | worst | audio | audio_only | 720p60 | 480p | 1080 ..."""
-    vs = variants(master_body)
+    vs = variants(master_body, base_url)
     if not vs:
         return None
     q = (quality or "best").strip().lower()
@@ -287,7 +343,7 @@ def resolve(channel: str = "", quality: str = "best", vod_id: str = "") -> str:
     url, body = master_playlist(channel, vod_id)
     if (quality or "best").lower() in ("master", "multi", "abr"):
         return url                       # let the player do the ABR switching
-    return pick_variant(body, quality) or url
+    return pick_variant(body, quality, url) or url
 
 
 # -------------------------------------------------------------------- metadata
@@ -843,7 +899,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.access_key:
             supplied = (qs.get("key") or [""])[0]
-            if not hmac.compare_digest(supplied, self.access_key):
+            if not hmac.compare_digest(supplied.encode(), self.access_key.encode()):
                 self.send_error(403, "missing or bad ?key=")
                 return
 
@@ -854,7 +910,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 url = (qs.get("url") or [""])[0]
                 sig = (qs.get("sig") or [""])[0]
-                if not hmac.compare_digest(sig, proxy_signature(url)):
+                if not hmac.compare_digest(sig.encode(), proxy_signature(url).encode()):
                     self.send_error(403, "invalid media link")
                     return
                 return self._relay_media(url)
@@ -931,8 +987,31 @@ class Handler(BaseHTTPRequestHandler):
             pass                            # player closed the connection
         except Offline as e:
             self.send_error(404, str(e))
+        except urllib.error.HTTPError as e:
+            # Keep range semantics and retryable failures, without relaying
+            # an upstream error page (which may contain signed URLs).
+            if e.code == 416:
+                self.send_response(416)
+                content_range = e.headers.get("Content-Range", "")
+                if re.fullmatch(r"bytes \*/\d+", content_range):
+                    self.send_header("Content-Range", content_range)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif e.code in (429, 502, 503, 504):
+                self._upstream_unavailable(e.code)
+            else:
+                self.send_error(502, "upstream request failed; reopen the channel")
+        except (OSError, http.client.HTTPException):
+            self._upstream_unavailable(503)
         except Exception:                   # noqa: BLE001 - report, don't die
             self.send_error(502, "upstream request failed")
+
+    def _upstream_unavailable(self, status: int):
+        self.send_response(status)
+        self.send_header("Retry-After", "3")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _redirect_stream(self, channel: str, quality: str, vod: str = ""):
         if self.full_proxy:
@@ -957,11 +1036,16 @@ class Handler(BaseHTTPRequestHandler):
             self.cache.put(key, url)
         if self.full_proxy:
             try:
-                return self._relay_media(url)
-            except urllib.error.HTTPError:
+                return self._relay_media(url, manifest=True, sequence_key=str(key))
+            except urllib.error.HTTPError as e:
+                if e.code not in (401, 403, 404, 410):
+                    raise
+                # A VPN exit change can invalidate IP-bound playback URLs.
+                # Refresh once for stale sessions, not for VPN outages/5xx.
+                self.cache.put(key, None)
                 url = resolve(channel, quality, vod_id=vod)
                 self.cache.put(key, url)
-                return self._relay_media(url)
+                return self._relay_media(url, manifest=True, sequence_key=str(key))
         try:
             body = _get(url)
         except urllib.error.HTTPError:
@@ -980,26 +1064,39 @@ class Handler(BaseHTTPRequestHandler):
             params["key"] = self.access_key
         return self.base_url() + "/media?" + urllib.parse.urlencode(params)
 
-    def _relay_media(self, url: str):
+    def _relay_media(self, url: str, *, manifest: bool = False, sequence_key: str = ""):
+        manifest = manifest or urllib.parse.urlsplit(url).path.lower().endswith((".m3u8", ".m3u"))
         headers = {}
-        if self.headers.get("Range"):
+        if self.headers.get("Range") and not manifest:
             headers["Range"] = self.headers["Range"]
+            if self.headers.get("If-Range"):
+                headers["If-Range"] = self.headers["If-Range"]
         with open_media(url, headers) as response:
             first = response.read(64 * 1024)
-            if first.lstrip().startswith(b"#EXTM3U"):
-                raw = first + response.read(4 * 1024 * 1024)
-                if len(raw) >= 4 * 1024 * 1024:
-                    raise TwitchError("upstream manifest too large")
-                body = raw.decode("utf-8")
+            ctype = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if (manifest or ctype in _HLS_TYPES
+                    or first.removeprefix(b"\xef\xbb\xbf").lstrip().startswith(b"#EXTM3U")):
+                if response.status != 200:
+                    raise TwitchError("partial upstream manifest")
+                raw = first + response.read(MAX_MANIFEST_BYTES + 1 - len(first))
+                body = decode_manifest(raw)
                 # VOD sequence numbers also determine implicit encryption IVs.
                 # Leave VOD and master playlists intact.
                 if ("#EXTINF:" in body and "#EXT-X-ENDLIST" not in body
-                        and "#EXT-X-KEY:" not in body):
-                    body = normaliser(url).rewrite(body)
+                        and "#EXT-X-KEY:" not in body
+                        and "#EXT-X-BYTERANGE:" not in body
+                        and "#EXT-X-PLAYLIST-TYPE:VOD" not in body):
+                    # Ignore expiring query signatures when tracking nested
+                    # renditions; root streams use channel + selected quality.
+                    stable_url = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
+                    body = normaliser(sequence_key or stable_url).rewrite(body)
                 body = rewrite_media_urls(body, response.geturl(), self._media_link)
                 return self._text(body, "application/vnd.apple.mpegurl")
+            if ctype in ("text/html", "application/xhtml+xml", "application/json"):
+                raise TwitchError("upstream returned an error document instead of media")
             self.send_response(response.status)
-            for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+            for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges",
+                         "ETag", "Last-Modified"):
                 if response.headers.get(name):
                     self.send_header(name, response.headers[name])
             self.send_header("Cache-Control", "no-store")
@@ -1011,7 +1108,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     self.wfile.write(chunk)
-            except OSError:
+            except (OSError, http.client.HTTPException):
                 # Headers have already been sent; never append an HTML error
                 # response to a partially streamed video segment.
                 self.close_connection = True
