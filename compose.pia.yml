@@ -36,6 +36,7 @@ services:
       TWITCH_M3U_KEY: ${TWITCH_M3U_KEY:?Set TWITCH_M3U_KEY in .env}
       TWITCH_AUTH_TOKEN: ${TWITCH_AUTH_TOKEN:-}
       TWITCH_M3U_FULL_PROXY: ${TWITCH_M3U_FULL_PROXY:-0}
+      TWITCH_M3U_PLAYER_TYPES: ${TWITCH_M3U_PLAYER_TYPES:-}
     volumes:
       - ./channels.txt:/app/channels.txt:ro
     read_only: true

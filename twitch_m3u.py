@@ -51,9 +51,51 @@ CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 GQL_URL = "https://gql.twitch.tv/gql"
 USHER_LIVE = "https://usher.ttvnw.net/api/channel/hls/{channel}.m3u8"
 USHER_VOD = "https://usher.ttvnw.net/vod/{vod_id}.m3u8"
-ACCESS_TOKEN_HASH = (
-    "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"
+TOKEN_QUERY = (
+    "query PlaybackAccessToken($login: String!, $isLive: Boolean!, $vodID: ID!, "
+    "$isVod: Boolean!, $playerType: String!, $platform: String!) { "
+    "streamPlaybackAccessToken(channelName: $login, params: {platform: $platform, "
+    "playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) "
+    "{ value signature } "
+    "videoPlaybackAccessToken(id: $vodID, params: {platform: $platform, "
+    "playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) "
+    "{ value signature } }"
 )
+
+# The playback token is signed over playerType + platform, and Twitch does not
+# stitch ads into every combination. Measured in September 2026 on eight live
+# channels: "site"/web (what the website asks for) carried a stitched preroll
+# on four; mobile_feed/android, popout/web and autoplay/android on none, and
+# mobile_feed keeps the full quality ladder where autoplay is capped at 360p.
+# Idea from pixeltris/TwitchAdSolutions and scamorza/TwitchAdBlock. Types are
+# tried in this order; a session that still turns up stitched moves the
+# channel on to the next one. "site" stays last as the plain fallback.
+DEFAULT_PLAYER_TYPES = (("mobile_feed", "android"), ("popout", "web"),
+                        ("autoplay", "android"), ("site", "web"))
+_MOBILE_PLAYER_TYPES = {"mobile_feed", "autoplay"}   # stitched again if asked as web
+
+
+def _parse_player_types(spec: str) -> tuple[tuple[str, str], ...]:
+    """TWITCH_M3U_PLAYER_TYPES="mobile_feed/android,popout/web,site" -> pairs."""
+    out = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        player_type, _, platform = item.partition("/")
+        player_type = player_type.strip().lower()
+        if not re.fullmatch(r"[a-z_]{1,32}", player_type):
+            continue
+        platform = platform.strip().lower() or (
+            "android" if player_type in _MOBILE_PLAYER_TYPES else "web")
+        out.append((player_type, platform))
+    return tuple(out) or DEFAULT_PLAYER_TYPES
+
+
+PLAYER_TYPES = _parse_player_types(os.environ.get("TWITCH_M3U_PLAYER_TYPES", ""))
+# One device id per process, sent with GQL and usher alike: an id that changes
+# between the two looks like a replay.
+_DEVICE_ID = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=32))
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
@@ -74,6 +116,7 @@ class Offline(TwitchError):
 def _post_gql(payload: dict, timeout: float = 10.0) -> dict:
     headers = {
         "Client-ID": CLIENT_ID,
+        "X-Device-Id": _DEVICE_ID,
         "Content-Type": "application/json",
         "User-Agent": UA,
         "Origin": "https://www.twitch.tv",
@@ -92,10 +135,6 @@ def _post_gql(payload: dict, timeout: float = 10.0) -> dict:
     with _pooled_request("POST", GQL_URL, headers, timeout,
                          body=json.dumps(payload).encode()) as r:
         return json.loads(r.read().decode())
-
-
-def _get(url: str, timeout: float = 10.0) -> str:
-    return fetch_manifest(url, timeout)[1]
 
 
 # Only the server can mint proxy links; clients cannot supply arbitrary targets.
@@ -359,18 +398,19 @@ def rewrite_media_urls(body: str, upstream: str, link) -> str:
 
 # ------------------------------------------------------------------- resolving
 
-def playback_token(channel: str = "", vod_id: str = "") -> tuple[str, str]:
+def playback_token(channel: str = "", vod_id: str = "", player_type: str = "site",
+                   platform: str = "web") -> tuple[str, str]:
     """Return (token, signature) for a live channel or a VOD."""
     data = _post_gql({
         "operationName": "PlaybackAccessToken",
-        "extensions": {"persistedQuery": {
-            "version": 1, "sha256Hash": ACCESS_TOKEN_HASH}},
+        "query": TOKEN_QUERY,
         "variables": {
             "isLive": not vod_id,
             "login": channel.lower(),
             "isVod": bool(vod_id),
             "vodID": vod_id,
-            "playerType": "site",
+            "playerType": player_type,
+            "platform": platform,
         },
     })
     if data.get("errors"):
@@ -395,9 +435,28 @@ def session_ids(key: str) -> tuple[str, str]:
     """
     with _SESSION_LOCK:
         if key not in _SESSION_IDS:
-            _SESSION_IDS[key] = ("%016x" % random.getrandbits(64),
-                                 "%032x" % random.getrandbits(128))
+            _SESSION_IDS[key] = (_DEVICE_ID, "%032x" % random.getrandbits(128))
         return _SESSION_IDS[key]
+
+
+# Which player type a channel is currently minted with. A stitched session
+# advances it; every type stitched at once parks the channel for a while so a
+# break does not cost a token round-trip per playlist reload.
+_PLAYER_CURSOR: dict[str, int] = {}
+_AD_SEEN_EVERYWHERE: dict[str, float] = {}
+_PLAYER_LOCK = threading.Lock()
+AD_RETRY_SECS = 60.0
+
+
+def player_type_for(channel: str) -> tuple[str, str]:
+    with _PLAYER_LOCK:
+        return PLAYER_TYPES[_PLAYER_CURSOR.get(channel, 0) % len(PLAYER_TYPES)]
+
+
+def next_player_type(channel: str) -> tuple[str, str]:
+    with _PLAYER_LOCK:
+        _PLAYER_CURSOR[channel] = (_PLAYER_CURSOR.get(channel, 0) + 1) % len(PLAYER_TYPES)
+        return PLAYER_TYPES[_PLAYER_CURSOR[channel]]
 
 
 def _usher(base: str, token: str, sig: str, session_key: str = "") -> str:
@@ -424,10 +483,12 @@ def _usher(base: str, token: str, sig: str, session_key: str = "") -> str:
 
 def master_playlist(channel: str = "", vod_id: str = "") -> tuple[str, str]:
     """Return (master_url, master_body). Raises Offline if not streaming."""
-    token, sig = playback_token(channel, vod_id)
+    player_type, platform = ("site", "web") if vod_id else player_type_for(channel.lower())
+    token, sig = playback_token(channel, vod_id, player_type, platform)
     base = (USHER_VOD.format(vod_id=vod_id) if vod_id
             else USHER_LIVE.format(channel=channel.lower()))
-    url = _usher(base, token, sig, session_key=(vod_id or channel).lower())
+    url = _usher(base, token, sig,
+                 session_key=f"{(vod_id or channel).lower()}/{player_type}")
     try:
         url, body = fetch_manifest(url)
     except urllib.error.HTTPError as e:
@@ -623,7 +684,9 @@ def normaliser(key: str) -> _SeqNormaliser:
 
 
 def in_ad_break(body: str) -> bool:
-    return "twitch-stitched-ad" in body
+    # The substring Twitch puts in a stitched break, on the DATERANGE and on
+    # the segment titles alike.
+    return "stitched" in body
 
 
 # ------------------------------------------------------------------- discovery
@@ -1198,36 +1261,76 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _proxy_media(self, channel: str, quality: str, vod: str = ""):
-        """Serve the media playlist with a monotonic sequence, so a player
-        rides through an ad break instead of stalling on it forever."""
+        """Serve the media playlist for a channel or VOD.
+
+        Sessions are minted with an ad-free player type. One that turns up
+        stitched anyway moves the channel on to the next type; only when every
+        type is stitched does the player ride the break on a monotonic
+        sequence instead of stalling on it forever.
+        """
         key = (channel or f"vod:{vod}", quality)
+        url, body = self._playlist(key, channel, quality, vod)
+        if channel and in_ad_break(body):
+            url, body = self._switch_player_type(key, channel, quality, url, body)
+        self._text(self._manifest_body(body, url, f"{key[0]}/{key[1]}"),
+                   "application/vnd.apple.mpegurl")
+
+    def _playlist(self, key, channel: str, quality: str, vod: str) -> tuple[str, str]:
         url = self.cache.get(key)
         if not url:
             url = resolve(channel, quality, vod_id=vod)
             self.cache.put(key, url)
-        if self.full_proxy:
-            try:
-                return self._relay_media(url, manifest=True, sequence_key=str(key))
-            except urllib.error.HTTPError as e:
-                if e.code not in (401, 403, 404, 410):
-                    raise
-                # A VPN exit change can invalidate IP-bound playback URLs.
-                # Refresh once for stale sessions, not for VPN outages/5xx.
-                self.cache.put(key, None)
-                url = resolve(channel, quality, vod_id=vod)
-                self.cache.put(key, url)
-                return self._relay_media(url, manifest=True, sequence_key=str(key))
         try:
-            body = _get(url)
-        except urllib.error.HTTPError:
-            self.cache.put(key, None)          # stale variant: re-resolve once
+            return self._fetch_playlist(url)
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403, 404, 410):
+                raise
+            # A VPN exit change can invalidate IP-bound playback URLs.
+            # Refresh once for stale sessions, not for VPN outages/5xx.
+            self.cache.put(key, None)
+            url = resolve(channel, quality, vod_id=vod)
+            self.cache.put(key, url)
+            return self._fetch_playlist(url)
+
+    @staticmethod
+    def _fetch_playlist(url: str) -> tuple[str, str]:
+        with open_media(url, {}) as response:
+            if response.status != 200:
+                raise TwitchError("partial upstream manifest")
+            return response.geturl(), decode_manifest(response.read(MAX_MANIFEST_BYTES + 1))
+
+    def _switch_player_type(self, key, channel: str, quality: str, url: str, body: str):
+        now = time.monotonic()
+        if now - _AD_SEEN_EVERYWHERE.get(channel, 0) < AD_RETRY_SECS:
+            self.log_message("%s: ad break, riding through", channel)
+            return url, body
+        tried = player_type_for(channel)[0]
+        for _ in range(len(PLAYER_TYPES) - 1):
+            player_type = next_player_type(channel)[0]
+            self.cache.put(key, None)
             url = resolve(channel, quality)
             self.cache.put(key, url)
-            body = _get(url)
-        fixed = normaliser(f"{channel}/{quality}").rewrite(body)
-        if in_ad_break(body):
-            self.log_message("%s: ad break, riding through", channel)
-        self._text(fixed, "application/vnd.apple.mpegurl")
+            url, body = self._fetch_playlist(url)
+            if not in_ad_break(body):
+                self.log_message("%s: stitched ad as %s, switched to %s",
+                                 channel, tried, player_type)
+                return url, body
+            tried = player_type
+        _AD_SEEN_EVERYWHERE[channel] = now
+        self.log_message("%s: ad break on every player type, riding through", channel)
+        return url, body
+
+    def _manifest_body(self, body: str, upstream: str, sequence_key: str) -> str:
+        # VOD sequence numbers also determine implicit encryption IVs. Leave
+        # VOD, encrypted, byte-range and master playlists intact.
+        if ("#EXTINF:" in body and "#EXT-X-ENDLIST" not in body
+                and "#EXT-X-KEY:" not in body
+                and "#EXT-X-BYTERANGE:" not in body
+                and "#EXT-X-PLAYLIST-TYPE:VOD" not in body):
+            body = normaliser(sequence_key).rewrite(body)
+        if self.full_proxy:
+            body = rewrite_media_urls(body, upstream, self._media_link)
+        return body
 
     def _media_link(self, url: str) -> str:
         params = {"url": url, "sig": proxy_signature(url)}
@@ -1250,18 +1353,11 @@ class Handler(BaseHTTPRequestHandler):
                 if response.status != 200:
                     raise TwitchError("partial upstream manifest")
                 raw = first + response.read(MAX_MANIFEST_BYTES + 1 - len(first))
-                body = decode_manifest(raw)
-                # VOD sequence numbers also determine implicit encryption IVs.
-                # Leave VOD and master playlists intact.
-                if ("#EXTINF:" in body and "#EXT-X-ENDLIST" not in body
-                        and "#EXT-X-KEY:" not in body
-                        and "#EXT-X-BYTERANGE:" not in body
-                        and "#EXT-X-PLAYLIST-TYPE:VOD" not in body):
-                    # Ignore expiring query signatures when tracking nested
-                    # renditions; root streams use channel + selected quality.
-                    stable_url = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
-                    body = normaliser(sequence_key or stable_url).rewrite(body)
-                body = rewrite_media_urls(body, response.geturl(), self._media_link)
+                # Ignore expiring query signatures when tracking nested
+                # renditions; root streams use channel + selected quality.
+                stable_url = urllib.parse.urlsplit(url)._replace(query="", fragment="").geturl()
+                body = self._manifest_body(decode_manifest(raw), response.geturl(),
+                                           sequence_key or stable_url)
                 return self._text(body, "application/vnd.apple.mpegurl")
             if ctype in ("text/html", "application/xhtml+xml", "application/json"):
                 raise TwitchError("upstream returned an error document instead of media")

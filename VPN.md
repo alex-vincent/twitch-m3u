@@ -31,9 +31,12 @@ fallback.
 `resolve` and `build --direct` still produce upstream URLs: do not use those
 for VPN playback on a separate device.
 
-**Ads are not guaranteed to disappear.** This selects a PIA region; it does not
-change Twitch entitlement flags or remove ads from streams. A PIA subscription
-is required.
+**The region is not what removes ads.** This selects a PIA exit; it does not
+change Twitch entitlement flags. Measured through the Albania exit in September
+2026, the website's `site` token still carried stitched prerolls on half the
+channels sampled. What removes them is the ad-free player type the server
+mints tokens with (see the README's "Commercial break in progress" section),
+which works on any exit. A PIA subscription is required for this stack.
 
 ## Prerequisites
 

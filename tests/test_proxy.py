@@ -215,7 +215,31 @@ class ProxyTests(unittest.TestCase):
             method, target, headers = fake.instances[0].requests[0]
             self.assertEqual((method, target), ('POST', '/gql'))
             self.assertEqual(headers['Client-ID'], app.CLIENT_ID)
+            self.assertEqual(headers['X-Device-Id'], app._DEVICE_ID)
             self.assertEqual(fake.instances[0].body, b'{"query": "test"}')
+
+    def test_player_types_are_parsed_with_platform_defaults(self):
+        self.assertEqual(app._parse_player_types(''), app.DEFAULT_PLAYER_TYPES)
+        self.assertEqual(app._parse_player_types(' popout/web, autoplay ,site, bad type!, mobile_feed/ios'),
+                         (('popout', 'web'), ('autoplay', 'android'), ('site', 'web'), ('mobile_feed', 'ios')))
+
+    def test_master_playlist_mints_the_channel_current_player_type(self):
+        app._PLAYER_CURSOR.clear()
+        with patch.object(app, 'PLAYER_TYPES', (('mobile_feed', 'android'), ('site', 'web'))), \
+                patch.object(app, '_post_gql', return_value={'data': {'streamPlaybackAccessToken': {'value': 'tok', 'signature': 'sig'}}}) as gql, \
+                patch.object(app, 'fetch_manifest', return_value=('https://usher.ttvnw.net/m.m3u8', '#EXTM3U\n')) as fetch:
+            app.master_playlist('Test')
+            variables = gql.call_args.args[0]['variables']
+            self.assertEqual((variables['playerType'], variables['platform'], variables['login']), ('mobile_feed', 'android', 'test'))
+            self.assertIn('query', gql.call_args.args[0])
+            url = fetch.call_args.args[0]
+            self.assertIn('play_session_id=', url)
+            self.assertIn('device_id=' + app._DEVICE_ID, url)
+            app.next_player_type('test')
+            app.master_playlist('test')
+            self.assertEqual(gql.call_args.args[0]['variables']['playerType'], 'site')
+            # a different player type is a different session
+            self.assertNotEqual(fetch.call_args_list[0].args[0], fetch.call_args_list[1].args[0])
 
     def test_all_hls_references(self):
         source = '''#EXTM3U
@@ -445,6 +469,64 @@ class HTTPTests(unittest.TestCase):
             with self.get('/help?key=test-key') as r:
                 r.read()
         self.assertNotIn('test-key', output.getvalue())
+
+    STITCHED = (b'#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-DATERANGE:ID="stitched-ad-1",CLASS="twitch-stitched-ad",START-DATE="2026-01-01T00:00:00Z",DURATION=30\n'
+                b'#EXTINF:2,Amazon|stitched\nhttps://video.ttvnw.net/ad1.ts\n')
+    CLEAN = b'#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:900\n#EXTINF:2,live\nhttps://video.ttvnw.net/live1.ts\n'
+
+    def _fresh_player_state(self):
+        app._PLAYER_CURSOR.clear()
+        app._AD_SEEN_EVERYWHERE.clear()
+
+    def test_stitched_session_moves_channel_to_next_player_type(self):
+        self._fresh_player_state()
+        urls = ['https://video.ttvnw.net/mobile.m3u8', 'https://video.ttvnw.net/popout.m3u8']
+        bodies = {urls[0]: self.STITCHED, urls[1]: self.CLEAN}
+        for full_proxy in (True, False):
+            self._fresh_player_state()
+            self.handler.full_proxy = full_proxy
+            self.handler.cache = app._Cache()
+            with patch.object(app, 'PLAYER_TYPES', (('mobile_feed', 'android'), ('popout', 'web'), ('site', 'web'))), \
+                    patch.object(app, 'resolve', side_effect=urls) as resolve, \
+                    patch.object(app, 'open_media', side_effect=lambda url, *a, **k: Response(bodies[url], url)) as fetch:
+                with self.get('/hls/test.m3u8?key=test-key') as r:
+                    body = r.read().decode()
+                self.assertNotIn('stitched', body)
+                self.assertIn('live1.ts', body)
+                self.assertEqual(resolve.call_count, 2)
+                self.assertEqual(app.player_type_for('test'), ('popout', 'web'))
+                self.assertEqual(self.handler.cache.get(('test', 'best')), urls[1])
+                # the next reload stays on the clean session without re-resolving
+                with self.get('/hls/test.m3u8?key=test-key') as r:
+                    self.assertIn('live1.ts', r.read().decode())
+                self.assertEqual(resolve.call_count, 2)
+                self.assertEqual(fetch.call_count, 3)
+
+    def test_every_player_type_stitched_rides_through_and_backs_off(self):
+        self._fresh_player_state()
+        self.handler.cache = app._Cache()
+        urls = ['https://video.ttvnw.net/a.m3u8', 'https://video.ttvnw.net/b.m3u8']
+        with patch.object(app, 'PLAYER_TYPES', (('mobile_feed', 'android'), ('site', 'web'))), \
+                patch.object(app, 'resolve', side_effect=urls) as resolve, \
+                patch.object(app, 'open_media', side_effect=lambda url, *a, **k: Response(self.STITCHED, url)):
+            with self.get('/hls/test.m3u8?key=test-key') as r:
+                body = r.read().decode()
+            self.assertIn('MEDIA-SEQUENCE:0', body)          # served, renumbered, not stalled
+            self.assertIn('ad1.ts', body)
+            self.assertEqual(resolve.call_count, 2)
+            with self.get('/hls/test.m3u8?key=test-key') as r:
+                r.read()
+            self.assertEqual(resolve.call_count, 2)          # parked: no token churn per reload
+
+    def test_vod_never_switches_player_type(self):
+        self._fresh_player_state()
+        url = 'https://video.ttvnw.net/vod.m3u8'
+        with patch.object(app, 'resolve', return_value=url) as resolve, \
+                patch.object(app, 'open_media', return_value=Response(self.STITCHED + b'#EXT-X-ENDLIST\n', url)):
+            with self.get('/vod/123.m3u8?key=test-key') as r:
+                self.assertIn('ad1.ts', r.read().decode())
+            self.assertEqual(resolve.call_count, 1)
+            self.assertEqual(app._PLAYER_CURSOR, {})
 
     def test_default_mode_keeps_legacy_redirect(self):
         self.handler.full_proxy = False

@@ -139,23 +139,40 @@ Worse, the ad is a **preroll** — Twitch serves one when a *new playback sessio
 starts. So a player that stalls and retries earns a fresh 30s ad every attempt.
 That is the "forever" part.
 
-Both are fixed:
+All three layers are handled:
 
+- **Ad-free player types.** The playback token is signed over the `playerType`
+  and `platform` the client asks for, and Twitch does not stitch ads into
+  every combination. Measured on eight live channels: the website's own
+  `site`/`web` token carried a stitched preroll on four; `mobile_feed` asked
+  as `android` on none, at the full quality ladder. Sessions are minted as
+  `mobile_feed` first, then `popout`, then `autoplay` (capped at 360p), then
+  plain `site`. A session that still comes back stitched moves that channel
+  on to the next type; once every type is stitched the channel is parked for a
+  minute and the break is ridden through instead. The idea comes from
+  [pixeltris/TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions)
+  and [scamorza/TwitchAdBlock](https://github.com/scamorza/TwitchAdBlock); the
+  browser scripts have to splice a clean backup stream into the page's own
+  stitched session, which a server that owns its session gets to skip.
+  Override the order with `TWITCH_M3U_PLAYER_TYPES="popout/web,site"`.
 - **`/hls/<channel>.m3u8`** proxies the manifest and renumbers it so the
-  sequence only moves forward. The ad still plays; the player survives it and
-  returns to content. Playlists point here by default.
-- **Sessions are now stable per channel**, so a reconnect continues the old
-  session instead of triggering another preroll, and resolved URLs are cached
-  for 10 minutes rather than 20 seconds.
+  sequence only moves forward. If an ad does get through, the player survives
+  it and returns to content. Playlists point here by default.
+- **Sessions are stable per channel and player type**, so a reconnect
+  continues the old session instead of triggering another preroll, and
+  resolved URLs are cached for 10 minutes rather than 20 seconds.
 
 `/live/<channel>.m3u8` still does the plain redirect if you prefer it.
 
-### Actually removing the ads
+Twitch does not endorse avoiding its ads and its terms of service forbid it;
+the anonymous default carries no account to act against, but that changes if
+you set `TWITCH_AUTH_TOKEN`.
 
-Twitch decides that server-side, from your account. The playback token comes
-back with `hide_ads`, `show_ads`, `turbo` and `subscriber` flags on it — with
-Turbo, or a sub to that channel, Twitch issues an ad-free token and the
-discontinuity that causes the stall never appears at all.
+### Removing them the sanctioned way
+
+The playback token comes back with `hide_ads`, `show_ads`, `turbo` and
+`subscriber` flags on it — with Turbo, or a sub to that channel, Twitch issues
+an ad-free token whatever the player type.
 
 If you have one of those, export your own OAuth token and the tool will use it:
 
