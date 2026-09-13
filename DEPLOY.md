@@ -4,6 +4,11 @@ Target used throughout: `twitch.vincentserver.com` → `192.18.147.171`.
 
 Run everything after step 2 on the VM, over SSH.
 
+**PIA Albania deployment:** use [VPN.md](VPN.md) to replace the Python systemd
+service with the VPN Docker stack. Keep the DNS, TLS, and Caddy configuration
+here. Full proxy mode also carries video segments through the VM, so the
+cross-IP limitation below applies only to the original manifest-only mode.
+
 ---
 
 ## 0. Read this first
