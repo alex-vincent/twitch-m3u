@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 twitch-full.m3u
 twitch-full-epg.xml
+.env
+.env.*
+!.env.example

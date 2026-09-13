@@ -1,0 +1,44 @@
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3.41.3
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      VPN_SERVICE_PROVIDER: private internet access
+      VPN_TYPE: openvpn
+      OPENVPN_PROTOCOL: udp
+      OPENVPN_ENDPOINT_PORT: "8080"
+      OPENVPN_USER: ${PIA_USERNAME:?Set PIA_USERNAME in .env}
+      OPENVPN_PASSWORD: ${PIA_PASSWORD:?Set PIA_PASSWORD in .env}
+      SERVER_REGIONS: Albania
+      UPDATER_PERIOD: 480h
+      FIREWALL: "on"
+      FIREWALL_INPUT_PORTS: "7777"
+    volumes:
+      - gluetun_data:/gluetun
+    ports:
+      - "${TWITCH_M3U_BIND_IP:-127.0.0.1}:${TWITCH_M3U_PORT:-7777}:7777"
+    restart: unless-stopped
+  twitch-m3u:
+    build: .
+    network_mode: service:gluetun
+    depends_on:
+      gluetun:
+        condition: service_healthy
+        restart: true
+    environment:
+      TWITCH_M3U_KEY: ${TWITCH_M3U_KEY:?Set TWITCH_M3U_KEY in .env}
+      TWITCH_AUTH_TOKEN: ${TWITCH_AUTH_TOKEN:-}
+    volumes:
+      - ./channels.txt:/app/channels.txt:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  gluetun_data:

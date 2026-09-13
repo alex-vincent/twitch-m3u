@@ -163,8 +163,10 @@ If you have one of those, export your own OAuth token and the tool will use it:
 export TWITCH_AUTH_TOKEN=...      # your account; read from the env, never logged
 ```
 
-Beyond that, this tool does not try to defeat ad delivery — no region-shifting
-proxies, no stripping ad segments out of the manifest.
+For optional PIA Albania routing, see [VPN.md](VPN.md). The Docker setup
+routes token requests, playlists, and video segments through the VPN. Regional
+routing does not guarantee ad-free playback; Twitch can still insert ads.
+The proxy does not strip ad segments.
 
 ## Stream titles and viewer counts (the EPG)
 

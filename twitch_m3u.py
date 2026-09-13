@@ -28,11 +28,13 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import datetime as dt
+import hashlib
 import hmac
 import json
 import os
 import random
 import re
+import secrets
 import sys
 import threading
 import time
@@ -91,6 +93,53 @@ def _get(url: str, timeout: float = 10.0) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
+
+
+# Only the server can mint proxy links; clients cannot supply arbitrary targets.
+_PROXY_SECRET = secrets.token_bytes(32)
+
+
+def validate_media_url(url: str) -> str:
+    u = urllib.parse.urlsplit(url)
+    host = (u.hostname or "").lower()
+    if (u.scheme != "https" or u.username or u.password or u.port not in (None, 443)
+            or not any(host == domain or host.endswith("." + domain)
+                       for domain in ("ttvnw.net", "twitchcdn.net", "twitch.tv"))):
+        raise TwitchError("unsupported upstream media URL")
+    return url
+
+
+class _MediaRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        validate_media_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def open_media(url: str, headers: dict | None = None):
+    validate_media_url(url)
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    # No inherited HTTP proxy: the VPN network namespace provides the route.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _MediaRedirect())
+    return opener.open(req, timeout=20)
+
+
+def proxy_signature(url: str) -> str:
+    return hmac.new(_PROXY_SECRET, url.encode(), hashlib.sha256).hexdigest()
+
+
+def rewrite_media_urls(body: str, upstream: str, link) -> str:
+    """Rewrite variants, segments, keys, maps, and low-latency URI attributes."""
+    def local(uri):
+        return link(validate_media_url(urllib.parse.urljoin(upstream, uri)))
+    lines = []
+    for line in body.splitlines():
+        if line and not line.startswith("#"):
+            line = local(line.strip())
+        elif line.startswith("#EXT"):
+            line = re.sub(r'(?<![A-Z-])URI="([^"\n]+)"',
+                          lambda m: 'URI="' + local(m.group(1)) + '"', line)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
 
 
 # ------------------------------------------------------------------- resolving
@@ -777,10 +826,13 @@ class Handler(BaseHTTPRequestHandler):
     channels_path = CHANNELS_FILE
     default_quality = "best"
     proxy_default = True      # playlists point at /hls (ad-stall-proof)
+    full_proxy = False        # all media stays inside the server/VPN network
     access_key = ""           # when set, every endpoint requires ?key=
 
     def log_message(self, fmt, *a):     # one tidy line per request
-        sys.stderr.write("  %s\n" % (fmt % a))
+        message = fmt % a
+        message = re.sub(r"(GET|HEAD) ([^ ?]+)\?[^ ]+", r"\1 \2?[redacted]", message)
+        sys.stderr.write("  %s\n" % message)
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -796,6 +848,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         try:
+            if path == "/media":
+                if not self.full_proxy:
+                    self.send_error(404)
+                    return
+                url = (qs.get("url") or [""])[0]
+                sig = (qs.get("sig") or [""])[0]
+                if not hmac.compare_digest(sig, proxy_signature(url)):
+                    self.send_error(403, "invalid media link")
+                    return
+                return self._relay_media(url)
             # A player pointed at the bare host must get a playlist, not prose:
             # IPTV apps happily parse a help page into one junk channel a line.
             wants_html = "text/html" in (self.headers.get("Accept") or "")
@@ -869,10 +931,12 @@ class Handler(BaseHTTPRequestHandler):
             pass                            # player closed the connection
         except Offline as e:
             self.send_error(404, str(e))
-        except Exception as e:              # noqa: BLE001 - report, don't die
-            self.send_error(502, f"{type(e).__name__}: {e}")
+        except Exception:                   # noqa: BLE001 - report, don't die
+            self.send_error(502, "upstream request failed")
 
     def _redirect_stream(self, channel: str, quality: str, vod: str = ""):
+        if self.full_proxy:
+            return self._proxy_media(channel, quality, vod)
         key = (channel or f"vod:{vod}", quality)
         url = self.cache.get(key)
         if not url:
@@ -883,14 +947,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-    def _proxy_media(self, channel: str, quality: str):
+    def _proxy_media(self, channel: str, quality: str, vod: str = ""):
         """Serve the media playlist with a monotonic sequence, so a player
         rides through an ad break instead of stalling on it forever."""
-        key = (channel, quality)
+        key = (channel or f"vod:{vod}", quality)
         url = self.cache.get(key)
         if not url:
-            url = resolve(channel, quality)
+            url = resolve(channel, quality, vod_id=vod)
             self.cache.put(key, url)
+        if self.full_proxy:
+            try:
+                return self._relay_media(url)
+            except urllib.error.HTTPError:
+                url = resolve(channel, quality, vod_id=vod)
+                self.cache.put(key, url)
+                return self._relay_media(url)
         try:
             body = _get(url)
         except urllib.error.HTTPError:
@@ -902,6 +973,48 @@ class Handler(BaseHTTPRequestHandler):
         if in_ad_break(body):
             self.log_message("%s: ad break, riding through", channel)
         self._text(fixed, "application/vnd.apple.mpegurl")
+
+    def _media_link(self, url: str) -> str:
+        params = {"url": url, "sig": proxy_signature(url)}
+        if self.access_key:
+            params["key"] = self.access_key
+        return self.base_url() + "/media?" + urllib.parse.urlencode(params)
+
+    def _relay_media(self, url: str):
+        headers = {}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        with open_media(url, headers) as response:
+            first = response.read(64 * 1024)
+            if first.lstrip().startswith(b"#EXTM3U"):
+                raw = first + response.read(4 * 1024 * 1024)
+                if len(raw) >= 4 * 1024 * 1024:
+                    raise TwitchError("upstream manifest too large")
+                body = raw.decode("utf-8")
+                # VOD sequence numbers also determine implicit encryption IVs.
+                # Leave VOD and master playlists intact.
+                if ("#EXTINF:" in body and "#EXT-X-ENDLIST" not in body
+                        and "#EXT-X-KEY:" not in body):
+                    body = normaliser(url).rewrite(body)
+                body = rewrite_media_urls(body, response.geturl(), self._media_link)
+                return self._text(body, "application/vnd.apple.mpegurl")
+            self.send_response(response.status)
+            for name in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                if response.headers.get(name):
+                    self.send_header(name, response.headers[name])
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(first)
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except OSError:
+                # Headers have already been sent; never append an HTML error
+                # response to a partially streamed video segment.
+                self.close_connection = True
 
     def _channel_set(self, path: str, qs: dict) -> list[dict]:
         """The exact channels a given playlist path represents."""
@@ -1028,8 +1141,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(host: str, port: int, quality: str, channels_path: str,
-          refresh: float = 900.0, key: str = "") -> None:
+          refresh: float = 900.0, key: str = "", full_proxy: bool = False) -> None:
     global DISCOVER_TTL
+    Handler.full_proxy = full_proxy or os.environ.get("TWITCH_M3U_FULL_PROXY", "") == "1"
     Handler.default_quality = quality
     Handler.channels_path = channels_path
     Handler.access_key = key or os.environ.get("TWITCH_M3U_KEY", "").strip()
@@ -1084,6 +1198,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="list every available quality instead")
 
     p = sub.add_parser("serve", help="run the redirect server")
+    p.add_argument("--full-proxy", action="store_true",
+                   help="proxy all HLS media through this server (for VPN use)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=7777)
     p.add_argument("-q", "--quality", default="best")
@@ -1165,7 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if a.cmd == "serve":
-        serve(a.host, a.port, a.quality, a.channels, a.refresh, a.key)
+        serve(a.host, a.port, a.quality, a.channels, a.refresh, a.key, a.full_proxy)
         return 0
 
     if a.cmd == "build":
