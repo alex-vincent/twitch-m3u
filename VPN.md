@@ -187,7 +187,11 @@ docker compose -f compose.pia.yml up -d --force-recreate
 
 Upstream connections are kept alive and reused per host, so a playlist reload
 or segment fetch does not pay a TLS handshake through the tunnel each time
-(about a second per connection on the Albania exit). Gluetun's DNS forwarder
+(about a second per connection on the Albania exit). The server resolves
+upstream hosts to IPv4 itself and keeps using the last answer for up to 15
+minutes when a lookup fails: the Albania exit measured 10-35% UDP loss, and a
+lost A answer otherwise leaves the OS with only IPv6 addresses, which have no
+route inside the namespace. Gluetun's DNS forwarder
 is set to plain DNS (`DNS_UPSTREAM_RESOLVER_TYPE: plain`): queries still
 travel inside the tunnel to the same upstream resolver, but DNS-over-TLS cost a
 TLS handshake per uncached name, 0.6-3.4 s measured, which dominated channel

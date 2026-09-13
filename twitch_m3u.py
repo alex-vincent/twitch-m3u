@@ -36,6 +36,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import ssl
 import sys
 import threading
@@ -85,12 +86,11 @@ def _post_gql(payload: dict, timeout: float = 10.0) -> dict:
     auth = os.environ.get("TWITCH_AUTH_TOKEN", "").strip()
     if auth:
         headers["Authorization"] = "OAuth " + auth.removeprefix("oauth:")
-    req = urllib.request.Request(
-        GQL_URL, data=json.dumps(payload).encode(), headers=headers)
-    # Use the same OS/VPN route as media requests, even if the parent shell
-    # exports HTTP(S)_PROXY. Otherwise tokens can be minted from another IP.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=timeout) as r:
+    # Same pooled, proxy-free route as media requests, even if the parent
+    # shell exports HTTP(S)_PROXY. Otherwise tokens can be minted from
+    # another IP than the one that fetches the stream.
+    with _pooled_request("POST", GQL_URL, headers, timeout,
+                         body=json.dumps(payload).encode()) as r:
         return json.loads(r.read().decode())
 
 
@@ -125,6 +125,61 @@ _pool_lock = threading.Lock()
 _ssl_context = ssl.create_default_context()
 _REDIRECTS = (301, 302, 303, 307, 308)
 
+# A lossy tunnel drops DNS answers. When the A answer is lost but the AAAA one
+# arrives, the OS hands back only IPv6 addresses, which have no route inside a
+# VPN namespace ("network is unreachable"). Resolve IPv4 ourselves, remember
+# the answer, and keep using it while a fresh lookup fails.
+_DNS_FRESH = 60.0           # seconds before we ask again
+_DNS_STALE = 900.0          # seconds a remembered answer may still be used
+_DNS_ATTEMPTS = 3           # cold lookups retried; a lost UDP answer is common on the tunnel
+_dns: dict[str, tuple[float, list[str]]] = {}
+_dns_lock = threading.Lock()
+
+
+def _resolve4(host: str) -> list[str]:
+    now = time.monotonic()
+    with _dns_lock:
+        hit = _dns.get(host)
+    if hit and now - hit[0] < _DNS_FRESH:
+        return hit[1]
+    ips: list[str] = []
+    for attempt in range(_DNS_ATTEMPTS):
+        try:
+            infos = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+            ips = list(dict.fromkeys(info[4][0] for info in infos))
+            break
+        except OSError:
+            if hit or attempt == _DNS_ATTEMPTS - 1:
+                break                        # a remembered answer beats waiting
+            time.sleep(0.3 * (attempt + 1))
+    if ips:
+        with _dns_lock:
+            _dns[host] = (now, ips)
+        return ips
+    if hit and now - hit[0] < _DNS_STALE:
+        return hit[1]                        # lookup failed: serve the last answer
+    raise OSError(f"could not resolve {host}")
+
+
+def _connect4(address, timeout=None, source_address=None):
+    host, port = address
+    err: Exception = OSError(f"no IPv4 address for {host}")
+    for ip in _resolve4(host):
+        try:
+            return socket.create_connection((ip, port), timeout, source_address)
+        except OSError as e:
+            err = e
+    raise err
+
+
+class _Connection(http.client.HTTPSConnection):
+    """HTTPS connection that dials cached IPv4 addresses; TLS still verifies
+    the hostname."""
+
+    def __init__(self, host: str, port: int, timeout: float):
+        super().__init__(host, port, timeout=timeout, context=_ssl_context)
+        self._create_connection = _connect4
+
 
 def _pool_acquire(host: str, port: int, timeout: float):
     """Return (connection, reused)."""
@@ -138,8 +193,7 @@ def _pool_acquire(host: str, port: int, timeout: float):
                     conn.sock.settimeout(timeout)
                 return conn, True
             conn.close()
-    return http.client.HTTPSConnection(host, port, timeout=timeout,
-                                       context=_ssl_context), False
+    return _Connection(host, port, timeout), False
 
 
 def _pool_release(conn) -> None:
@@ -193,14 +247,15 @@ class _PooledResponse:
         self.close()
 
 
-def _pooled_get(url: str, headers: dict, timeout: float):
+def _pooled_request(method: str, url: str, headers: dict, timeout: float,
+                    body: bytes | None = None):
     for _ in range(6):                          # original request + 5 redirects
         validate_media_url(url)
         u = urllib.parse.urlsplit(url)
         target = (u.path or "/") + ("?" + u.query if u.query else "")
         conn, reused = _pool_acquire(u.hostname, u.port or 443, timeout)
         try:
-            conn.request("GET", target, headers=headers)
+            conn.request(method, target, body=body, headers=headers)
             resp = conn.getresponse()
         except (http.client.HTTPException, OSError):
             conn.close()
@@ -208,10 +263,9 @@ def _pooled_get(url: str, headers: dict, timeout: float):
                 raise
             # The server closed an idle pooled connection under us: one retry
             # on a fresh connection. Nothing was streamed yet, so it is safe.
-            conn = http.client.HTTPSConnection(u.hostname, u.port or 443,
-                                               timeout=timeout, context=_ssl_context)
+            conn = _Connection(u.hostname, u.port or 443, timeout)
             try:
-                conn.request("GET", target, headers=headers)
+                conn.request(method, target, body=body, headers=headers)
                 resp = conn.getresponse()
             except (http.client.HTTPException, OSError):
                 conn.close()
@@ -220,6 +274,8 @@ def _pooled_get(url: str, headers: dict, timeout: float):
             location = urllib.parse.urljoin(url, resp.msg["Location"])
             resp.read()
             _PooledResponse(conn, resp, url)._finish()
+            if method != "GET":
+                raise TwitchError("unexpected upstream redirect")
             url = validate_media_url(location)
             continue
         if resp.status >= 400:
@@ -237,7 +293,7 @@ def open_media(url: str, headers: dict | None = None, timeout: float = 20):
     request can never be steered off the Twitch CDN. HTTP(S)_PROXY from the
     environment is never consulted: the VPN network namespace is the route.
     """
-    return _pooled_get(url, {"User-Agent": UA, **(headers or {})}, timeout)
+    return _pooled_request("GET", url, {"User-Agent": UA, **(headers or {})}, timeout)
 
 
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024

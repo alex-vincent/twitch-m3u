@@ -47,13 +47,14 @@ class FakeConn:
     script = []
     instances = []
 
-    def __init__(self, host, port=None, timeout=None, context=None):
+    def __init__(self, host, port=None, timeout=None):
         self.host, self.port, self.timeout, self.sock = host, port, timeout, None
         self.requests, self.closed = [], False
         FakeConn.instances.append(self)
 
-    def request(self, method, target, headers=None):
+    def request(self, method, target, body=None, headers=None):
         self.requests.append((method, target, headers))
+        self.body = body
 
     def getresponse(self):
         item = FakeConn.script.pop(0)
@@ -69,9 +70,52 @@ class FakeConn:
     def install(cls, *script):
         cls.script, cls.instances = list(script), []
         app._pool.clear()
-        with patch.object(app.http.client, 'HTTPSConnection', cls):
+        with patch.object(app, '_Connection', cls):
             yield cls
         app._pool.clear()
+
+
+class ResolverTests(unittest.TestCase):
+    def setUp(self):
+        app._dns.clear()
+
+    def test_ipv4_only_and_stale_answer_survives_a_failed_lookup(self):
+        v4 = [(2, 1, 6, '', ('1.2.3.4', 443)), (2, 1, 6, '', ('1.2.3.4', 443)), (2, 1, 6, '', ('5.6.7.8', 443))]
+        with patch.object(app.socket, 'getaddrinfo', return_value=v4) as gai:
+            self.assertEqual(app._resolve4('a.ttvnw.net'), ['1.2.3.4', '5.6.7.8'])
+            self.assertEqual(gai.call_args.args[2], app.socket.AF_INET)
+            self.assertEqual(app._resolve4('a.ttvnw.net'), ['1.2.3.4', '5.6.7.8'])
+            self.assertEqual(gai.call_count, 1)                    # fresh answer reused
+        app._dns['a.ttvnw.net'] = (app.time.monotonic() - app._DNS_FRESH - 1, ['1.2.3.4'])
+        with patch.object(app.socket, 'getaddrinfo', side_effect=app.socket.gaierror('lost')):
+            self.assertEqual(app._resolve4('a.ttvnw.net'), ['1.2.3.4'])  # stale beats failing
+            with self.assertRaises(OSError):
+                app._resolve4('never-seen.ttvnw.net')
+
+    def test_cold_lookup_is_retried_before_giving_up(self):
+        v4 = [(2, 1, 6, '', ('1.2.3.4', 443))]
+        with patch.object(app.socket, 'getaddrinfo', side_effect=[app.socket.gaierror('lost'), v4]) as gai, \
+                patch.object(app.time, 'sleep') as sleep:
+            self.assertEqual(app._resolve4('cold.ttvnw.net'), ['1.2.3.4'])
+            self.assertEqual(gai.call_count, 2)
+            sleep.assert_called_once()
+        with patch.object(app.socket, 'getaddrinfo', side_effect=app.socket.gaierror('lost')) as gai, \
+                patch.object(app.time, 'sleep'):
+            with self.assertRaises(OSError):
+                app._resolve4('gone.ttvnw.net')
+            self.assertEqual(gai.call_count, app._DNS_ATTEMPTS)
+
+    def test_connect_tries_each_address(self):
+        calls = []
+        def create(addr, timeout=None, source_address=None):
+            calls.append(addr)
+            if addr[0] == '1.2.3.4':
+                raise ConnectionRefusedError()
+            return 'sock'
+        with patch.object(app, '_resolve4', return_value=['1.2.3.4', '5.6.7.8']), \
+                patch.object(app.socket, 'create_connection', side_effect=create):
+            self.assertEqual(app._connect4(('a.ttvnw.net', 443), 5), 'sock')
+        self.assertEqual(calls, [('1.2.3.4', 443), ('5.6.7.8', 443)])
 
 
 class PoolTests(unittest.TestCase):
@@ -164,10 +208,14 @@ class ProxyTests(unittest.TestCase):
         self.assertIn('audio.m3u8%3Fx%3Da%2Cb', result)
 
     def test_gql_does_not_inherit_environment_proxy(self):
-        with patch.object(app.urllib.request, 'build_opener') as build:
-            build.return_value.open.return_value = Response(b'{"data":{}}', app.GQL_URL)
+        with patch.dict(app.os.environ, {'HTTPS_PROXY': 'http://127.0.0.1:3128'}), \
+                FakeConn.install(FakeResponse(body=b'{"data":{}}')) as fake:
             self.assertEqual(app._post_gql({'query': 'test'}), {'data': {}})
-            self.assertEqual(build.call_args.args[0].proxies, {})
+            self.assertEqual((fake.instances[0].host, fake.instances[0].port), ('gql.twitch.tv', 443))
+            method, target, headers = fake.instances[0].requests[0]
+            self.assertEqual((method, target), ('POST', '/gql'))
+            self.assertEqual(headers['Client-ID'], app.CLIENT_ID)
+            self.assertEqual(fake.instances[0].body, b'{"query": "test"}')
 
     def test_all_hls_references(self):
         source = '''#EXTM3U
