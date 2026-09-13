@@ -161,6 +161,25 @@ docker compose -f compose.pia.yml up -d --force-recreate
 
 ## Checks and limits
 
+The parser accepts relative and protocol-relative rendition URLs, CRLF line
+endings, and quoted attributes containing commas. Relative links use the final
+upstream URL after redirects. All Twitch token and media requests use the OS
+network route; inherited `HTTP_PROXY`/`HTTPS_PROXY` settings are ignored so they
+cannot put token requests and video on different exit IPs.
+
+For `/hls`, `/live`, and `/vod`, a stale upstream response (401/403/404/410)
+triggers one fresh resolution. Sequence tracking for unencrypted live streams
+survives that URL refresh. VPN transport failures return a retryable response
+without creating a fresh playback session or redirecting the player outside
+the proxy. If an already-issued nested `/media` link expires, reopen the
+channel to obtain a current manifest; arbitrary segment URLs are never
+replaced with guessed equivalents.
+
+Expected manifests are validated before they reach the player. HTML/JSON
+upstream error documents are rejected instead of being served as video.
+Byte-range responses and 416 errors retain their range headers; encrypted,
+VOD, and byte-range playlists retain their original media sequence.
+
 ```bash
 python3 -m unittest discover -s tests -v
 ```
