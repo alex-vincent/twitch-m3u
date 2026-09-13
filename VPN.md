@@ -70,7 +70,7 @@ are process-local and old links then expire.
 To inspect the configured region list without credentials:
 
 ```bash
-docker run --rm qmcgaw/gluetun:v3.41.0 format-servers -private-internet-access
+docker run --rm qmcgaw/gluetun:v3.41.3 format-servers -private-internet-access
 ```
 
 The server list is stored in a named volume and refreshed every 480 hours.
