@@ -6,8 +6,8 @@ Run everything after step 2 on the VM, over SSH.
 
 **PIA Albania deployment:** use [VPN.md](VPN.md) to replace the Python systemd
 service with the VPN Docker stack. Keep the DNS, TLS, and Caddy configuration
-here. Full proxy mode also carries video segments through the VM, so the
-cross-IP limitation below applies only to the original manifest-only mode.
+here. The stack's default mode is manifest-only and depends on the step 8
+result; `TWITCH_M3U_FULL_PROXY=1` carries video segments through the VM as well.
 
 ---
 
@@ -151,6 +151,9 @@ Take the `https://twitch.vincentserver.com/hls/...` URL it prints and open it in
 VLC on that device.
 
 - **It plays** → token IP binding is not enforced. You are done.
+  Measured in September 2026 from this VM through a PIA Albania exit: it
+  played, so binding was not enforced and the PIA stack's default mode relies
+  on it. Re-run this test if playback ever starts failing with 403s.
 - **403 / forbidden / stalls immediately** → tokens are bound to the minting IP.
   The redirect and manifest-proxy designs both fail for remote viewers, and the
   only fix is proxying the video segments themselves through the VM, which

@@ -36,6 +36,7 @@ import os
 import random
 import re
 import secrets
+import ssl
 import sys
 import threading
 import time
@@ -111,18 +112,132 @@ def validate_media_url(url: str) -> str:
     return url
 
 
-class _MediaRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        validate_media_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+# ------------------------------------------------------------ keep-alive pool
+# Each upstream request used to open its own TCP+TLS connection. Through a
+# VPN tunnel that handshake measured about a second, paid again on every
+# playlist reload and every segment. Reusing one connection per host removes
+# it; players see the same urllib-shaped response object as before.
+
+_POOL_IDLE_MAX = 4          # idle connections kept per host
+_POOL_IDLE_TTL = 30.0       # seconds; CDNs drop idle connections quietly
+_pool: dict[tuple[str, int], list[tuple[float, http.client.HTTPSConnection]]] = {}
+_pool_lock = threading.Lock()
+_ssl_context = ssl.create_default_context()
+_REDIRECTS = (301, 302, 303, 307, 308)
+
+
+def _pool_acquire(host: str, port: int, timeout: float):
+    """Return (connection, reused)."""
+    with _pool_lock:
+        idle = _pool.get((host, port), [])
+        while idle:
+            since, conn = idle.pop()
+            if time.monotonic() - since < _POOL_IDLE_TTL:
+                conn.timeout = timeout
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+                return conn, True
+            conn.close()
+    return http.client.HTTPSConnection(host, port, timeout=timeout,
+                                       context=_ssl_context), False
+
+
+def _pool_release(conn) -> None:
+    with _pool_lock:
+        idle = _pool.setdefault((conn.host, conn.port), [])
+        if len(idle) < _POOL_IDLE_MAX:
+            idle.append((time.monotonic(), conn))
+            return
+    conn.close()
+
+
+class _PooledResponse:
+    """urllib-like view of an http.client response. The connection goes back
+    to the pool once the body has been read to the end, otherwise it is
+    closed: a half-read connection cannot be reused."""
+
+    def __init__(self, conn, resp, url: str):
+        self._conn, self._resp, self._url = conn, resp, url
+        self.status = resp.status
+        self.headers = resp.msg
+        self._done = False
+
+    def geturl(self) -> str:
+        return self._url
+
+    def read(self, amt=None) -> bytes:
+        data = self._resp.read(amt)
+        if self._resp.isclosed():
+            self._finish()
+        return data
+
+    def _finish(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        if self._resp.isclosed() and not self._resp.will_close:
+            _pool_release(self._conn)
+        else:
+            self._conn.close()
+
+    def close(self) -> None:
+        if not self._done:
+            self._done = True
+            self._resp.close()
+            self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def _pooled_get(url: str, headers: dict, timeout: float):
+    for _ in range(6):                          # original request + 5 redirects
+        validate_media_url(url)
+        u = urllib.parse.urlsplit(url)
+        target = (u.path or "/") + ("?" + u.query if u.query else "")
+        conn, reused = _pool_acquire(u.hostname, u.port or 443, timeout)
+        try:
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+        except (http.client.HTTPException, OSError):
+            conn.close()
+            if not reused:
+                raise
+            # The server closed an idle pooled connection under us: one retry
+            # on a fresh connection. Nothing was streamed yet, so it is safe.
+            conn = http.client.HTTPSConnection(u.hostname, u.port or 443,
+                                               timeout=timeout, context=_ssl_context)
+            try:
+                conn.request("GET", target, headers=headers)
+                resp = conn.getresponse()
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                raise
+        if resp.status in _REDIRECTS and resp.msg.get("Location"):
+            location = urllib.parse.urljoin(url, resp.msg["Location"])
+            resp.read()
+            _PooledResponse(conn, resp, url)._finish()
+            url = validate_media_url(location)
+            continue
+        if resp.status >= 400:
+            msg = resp.msg
+            conn.close()                     # error bodies are not worth pooling
+            raise urllib.error.HTTPError(url, resp.status, resp.reason, msg, None)
+        return _PooledResponse(conn, resp, url)
+    raise TwitchError("too many upstream redirects")
 
 
 def open_media(url: str, headers: dict | None = None, timeout: float = 20):
-    validate_media_url(url)
-    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
-    # No inherited HTTP proxy: the VPN network namespace provides the route.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _MediaRedirect())
-    return opener.open(req, timeout=timeout)
+    """GET a Twitch media URL over a pooled TLS connection.
+
+    Redirect targets are validated like the original URL, so a proxied
+    request can never be steered off the Twitch CDN. HTTP(S)_PROXY from the
+    environment is never consulted: the VPN network namespace is the route.
+    """
+    return _pooled_get(url, {"User-Agent": UA, **(headers or {})}, timeout)
 
 
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024

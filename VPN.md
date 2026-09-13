@@ -3,18 +3,37 @@
 This optional Docker Compose stack sends the Python service's outbound traffic
 through Private Internet Access's Albania OpenVPN region. Gluetun supplies the
 VPN and firewall kill switch. Twitch M3U waits for Gluetun to be healthy at
-startup and shares its network namespace. There is no non-VPN service in this
-stack and no direct-player fallback when upstream requests fail.
+startup and shares its network namespace, so every request the server makes
+itself (playback tokens, usher, playlists) leaves through the VPN. There is no
+non-VPN service in this stack and no direct-player fallback when those
+requests fail.
 
-`--full-proxy` carries manifests, nested quality/audio playlists, segments,
-encryption keys, and initialization files through the server. `/live` and `/vod`
-are also proxied in this mode. `resolve` and `build --direct` still produce
-upstream URLs: do not use those for VPN playback on a separate device.
+## What goes through the tunnel
+
+By default only the server's own requests do. Playlists served from `/hls`
+keep Twitch's segment URLs, so the player downloads video straight from
+Twitch's CDN over its own connection. Measured in September 2026 from a
+Toronto VM with the Albania exit: the tunnel sustained about 1-5 Mbit/s with a
+~1 s TLS handshake per connection, while a source-quality stream needs about
+7 Mbit/s, so carrying segments through it buffered constantly. Twitch did not
+enforce IP binding: playlist and segment URLs minted through the Albania exit
+played from a different IP.
+
+Set `TWITCH_M3U_FULL_PROXY=1` in `.env` (or run `serve --full-proxy`) to carry
+manifests, nested quality/audio playlists, segments, encryption keys, and
+initialization files through the server as well. `/live` and `/vod` are also
+proxied in that mode. It keeps viewers' IPs away from Twitch's CDN at the cost
+of every viewer's bandwidth crossing the tunnel (roughly 3.6 GB/hour at
+8 Mbps, before overhead), which only works on a fast tunnel. If Twitch starts
+rejecting segment fetches from an IP other than the token's, this is the
+fallback.
+
+`resolve` and `build --direct` still produce upstream URLs: do not use those
+for VPN playback on a separate device.
 
 **Ads are not guaranteed to disappear.** This selects a PIA region; it does not
 change Twitch entitlement flags or remove ads from streams. A PIA subscription
-is required. Full proxying consumes VM bandwidth for every viewer (roughly
-3.6 GB/hour at 8 Mbps, before overhead).
+is required.
 
 ## Prerequisites
 
@@ -61,11 +80,13 @@ Open in your player (adjust port and replace YOUR_KEY):
 http://127.0.0.1:7778/games.m3u8?games=5&per=10&key=YOUR_KEY
 ```
 
-All playable URLs, including URLs inside a channel's manifest, must point at
-this server's `/media` endpoint. Test `?q=master` as well as the default quality.
-Thumbnails may still be loaded directly by the IPTV app; they are not playback
-traffic. Reopen a channel after restarting the app container: media signatures
-are process-local and old links then expire.
+In the default mode, `/hls/<channel>.m3u8` must be served by this server and
+list segment URLs on `*.ttvnw.net`. With `TWITCH_M3U_FULL_PROXY=1`, all
+playable URLs, including URLs inside a channel's manifest, must point at this
+server's `/media` endpoint instead, and a channel has to be reopened after the
+app container restarts because media signatures are process-local. Test
+`?q=master` as well as the default quality. Thumbnails may still be loaded
+directly by the IPTV app; they are not playback traffic.
 
 To inspect the configured region list without credentials:
 
@@ -148,8 +169,11 @@ Rollback restores the original non-VPN service.
 Perform a controlled VPN outage on the test stack before production cutover.
 Interrupt the VPN tunnel using the Docker host's network controls while leaving
 the Gluetun firewall enabled. The exit-IP command above must fail during the
-outage, and playback must stop after buffered media is consumed. It must not
-switch to the VM's public IP. Gluetun may reconnect automatically; a successful
+outage, playlist reloads must return 503, and playback must stall once the
+segments already listed have played out. It must not switch to the VM's public
+IP. In the default mode the player fetches segments itself, so those keep
+loading for the few seconds they remain listed; in full-proxy mode they stop
+with the tunnel. Gluetun may reconnect automatically; a successful
 request after reconnection is expected. Simply stopping the Gluetun container
 is not conclusive, since a shared namespace can retain its tunnel.
 
@@ -160,6 +184,14 @@ docker compose -f compose.pia.yml up -d --force-recreate
 ```
 
 ## Checks and limits
+
+Upstream connections are kept alive and reused per host, so a playlist reload
+or segment fetch does not pay a TLS handshake through the tunnel each time
+(about a second per connection on the Albania exit). Gluetun's DNS forwarder
+is set to plain DNS (`DNS_UPSTREAM_RESOLVER_TYPE: plain`): queries still
+travel inside the tunnel to the same upstream resolver, but DNS-over-TLS cost a
+TLS handshake per uncached name, 0.6-3.4 s measured, which dominated channel
+start time.
 
 The parser accepts relative and protocol-relative rendition URLs, CRLF line
 endings, and quoted attributes containing commas. Relative links use the final

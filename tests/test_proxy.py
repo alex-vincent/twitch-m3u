@@ -21,6 +21,114 @@ class Response(io.BytesIO):
         return self.url
 
 
+class FakeResponse(io.BytesIO):
+    """Stand-in for http.client.HTTPResponse."""
+    def __init__(self, status=200, body=b'', headers=None, will_close=False):
+        super().__init__(body)
+        self.status, self.reason, self.will_close = status, 'reason', will_close
+        self.msg = http.client.HTTPMessage()
+        for k, v in (headers or {}).items():
+            self.msg[k] = v
+        self._closed = False
+
+    def read(self, amt=None):
+        data = super().read(amt)
+        if amt is None or len(data) < amt or self.tell() == len(self.getvalue()):
+            self._closed = True
+        return data
+
+    def isclosed(self):
+        return self._closed
+
+
+class FakeConn:
+    """Scripted http.client.HTTPSConnection: each new connection pops the next
+    item off `script`; an exception instance is raised on getresponse()."""
+    script = []
+    instances = []
+
+    def __init__(self, host, port=None, timeout=None, context=None):
+        self.host, self.port, self.timeout, self.sock = host, port, timeout, None
+        self.requests, self.closed = [], False
+        FakeConn.instances.append(self)
+
+    def request(self, method, target, headers=None):
+        self.requests.append((method, target, headers))
+
+    def getresponse(self):
+        item = FakeConn.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def close(self):
+        self.closed = True
+
+    @classmethod
+    @contextlib.contextmanager
+    def install(cls, *script):
+        cls.script, cls.instances = list(script), []
+        app._pool.clear()
+        with patch.object(app.http.client, 'HTTPSConnection', cls):
+            yield cls
+        app._pool.clear()
+
+
+class PoolTests(unittest.TestCase):
+    def test_connection_is_reused_after_a_fully_read_response(self):
+        with FakeConn.install(FakeResponse(body=b'#EXTM3U\n'), FakeResponse(body=b'#EXTM3U\n')) as fake:
+            for _ in range(2):
+                with app.open_media('https://a.ttvnw.net/p.m3u8?x=1') as r:
+                    self.assertEqual(r.read(), b'#EXTM3U\n')
+            self.assertEqual(len(fake.instances), 1)
+            self.assertEqual([t for _, t, _ in fake.instances[0].requests], ['/p.m3u8?x=1'] * 2)
+            self.assertEqual(fake.instances[0].requests[0][2]['User-Agent'], app.UA)
+
+    def test_half_read_response_closes_instead_of_pooling(self):
+        with FakeConn.install(FakeResponse(body=b'0123456789'), FakeResponse(body=b'x')) as fake:
+            with app.open_media('https://a.ttvnw.net/seg.ts') as r:
+                self.assertEqual(r.read(4), b'0123')
+            self.assertTrue(fake.instances[0].closed)
+            with app.open_media('https://a.ttvnw.net/seg.ts') as r:
+                r.read()
+            self.assertEqual(len(fake.instances), 2)
+
+    def test_stale_pooled_connection_is_retried_once_on_a_fresh_one(self):
+        with FakeConn.install(FakeResponse(body=b'a'), http.client.RemoteDisconnected(), FakeResponse(body=b'b')) as fake:
+            with app.open_media('https://a.ttvnw.net/1') as r:
+                r.read()
+            with app.open_media('https://a.ttvnw.net/2') as r:
+                self.assertEqual(r.read(), b'b')
+            self.assertEqual(len(fake.instances), 2)
+            self.assertTrue(fake.instances[0].closed)
+        with FakeConn.install(http.client.RemoteDisconnected()):
+            with self.assertRaises(http.client.HTTPException):
+                app.open_media('https://a.ttvnw.net/3')
+
+    def test_redirects_are_followed_validated_and_reported_as_final_url(self):
+        with FakeConn.install(FakeResponse(302, headers={'Location': '/final/master.m3u8'}),
+                              FakeResponse(body=b'#EXTM3U\n')) as fake:
+            with app.open_media('https://a.ttvnw.net/start') as r:
+                self.assertEqual(r.geturl(), 'https://a.ttvnw.net/final/master.m3u8')
+                self.assertEqual(r.read(), b'#EXTM3U\n')
+            self.assertEqual(len(fake.instances), 1)         # same host, connection reused
+
+    def test_upstream_errors_raise_http_error_with_headers(self):
+        with FakeConn.install(FakeResponse(416, headers={'Content-Range': 'bytes */10'})) as fake:
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                app.open_media('https://a.ttvnw.net/seg.ts')
+            self.assertEqual(cm.exception.code, 416)
+            self.assertEqual(cm.exception.headers.get('Content-Range'), 'bytes */10')
+            self.assertTrue(fake.instances[0].closed)
+
+    def test_connection_close_responses_are_not_pooled(self):
+        with FakeConn.install(FakeResponse(body=b'a', will_close=True), FakeResponse(body=b'b')) as fake:
+            for _ in range(2):
+                with app.open_media('https://a.ttvnw.net/x') as r:
+                    r.read()
+            self.assertEqual(len(fake.instances), 2)
+
+
 class ProxyTests(unittest.TestCase):
     def test_variants_with_relative_urls_crlf_and_reordered_attributes(self):
         body = ('#EXTM3U\r\n'
@@ -89,9 +197,9 @@ https://video.twitchcdn.net/segment.ts?token=abc
                     'https://user@video.ttvnw.net/a', 'https://ttvnw.net:8080/a'):
             with self.subTest(url=url), self.assertRaises(app.TwitchError):
                 app.validate_media_url(url)
-        with self.assertRaises(app.TwitchError):
-            app._MediaRedirect().redirect_request(None, None, 302, '', {},
-                                                   'https://127.0.0.1/private')
+        with FakeConn.install(FakeResponse(302, headers={'Location': 'https://127.0.0.1/private'})):
+            with self.assertRaises(app.TwitchError):
+                app.open_media('https://video.ttvnw.net/a')
 
     def test_signature_binds_entire_url(self):
         self.assertNotEqual(app.proxy_signature('https://a.ttvnw.net/a'),

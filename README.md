@@ -164,7 +164,8 @@ export TWITCH_AUTH_TOKEN=...      # your account; read from the env, never logge
 ```
 
 For optional PIA Albania routing, see [VPN.md](VPN.md). The Docker setup
-routes token requests, playlists, and video segments through the VPN. Regional
+routes token requests and playlists through the VPN; video segments go straight
+from the player to Twitch's CDN unless `TWITCH_M3U_FULL_PROXY=1`. Regional
 routing does not guarantee ad-free playback; Twitch can still insert ads.
 The proxy does not strip ad segments.
 
