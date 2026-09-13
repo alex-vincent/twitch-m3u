@@ -42,6 +42,7 @@ contain them, so use `config --quiet` for validation.
 
 ```bash
 docker compose -f compose.pia.yml config --quiet
+docker compose -f compose.pia.yml run --rm --no-deps gluetun update -enduser -providers "private internet access"
 docker compose -f compose.pia.yml up -d --build
 docker compose -f compose.pia.yml ps
 docker compose -f compose.pia.yml logs --tail=60 gluetun
@@ -71,6 +72,9 @@ To inspect the configured region list without credentials:
 ```bash
 docker run --rm qmcgaw/gluetun:v3.41.0 format-servers -private-internet-access
 ```
+
+The server list is stored in a named volume and refreshed every 480 hours.
+Run the update command above before first startup; bundled endpoints can be stale.
 
 If Albania is unavailable, the stack must fail rather than silently select a
 different country. Check Gluetun's logs and provider/server updates.
