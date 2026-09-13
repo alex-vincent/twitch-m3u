@@ -81,6 +81,12 @@ different country. Check Gluetun's logs and provider/server updates.
 
 ## Oracle VM migration
 
+The existing Oracle installation runs this stack from `/opt/twitch-m3u-pia`,
+with its private configuration in `/opt/twitch-m3u-pia/.env`. Use that directory
+for updates and Compose commands. `/opt/twitch-m3u` remains the original
+systemd installation for rollback. The instructions below also cover a fresh
+migration.
+
 Deploy this version of the repository to `/opt/twitch-m3u`. Keep a copy of your
 existing `channels.txt` before replacing a checkout. Configure `.env` on the VM
 as above, preserving the **existing** `TWITCH_M3U_KEY` so playlist URLs continue
@@ -97,18 +103,18 @@ After the VPN and playback checks pass, stop the old service:
 sudo systemctl stop twitch-m3u
 ```
 
-Set `TWITCH_M3U_PORT=7777` in the VM's `.env`. Recreate **both** containers so
-they share the current VPN network namespace:
+Set `TWITCH_M3U_PORT=7777` in the VM's `.env`.
+On the current Oracle deployment Caddy is containerized and uses
+`reverse_proxy 172.19.0.1:7777`. Set `TWITCH_M3U_BIND_IP=172.19.0.1` on Oracle
+before cutover to preserve that upstream. For local tests and Caddy running
+directly on the host, leave `TWITCH_M3U_BIND_IP=127.0.0.1`.
+
+Recreate **both** containers so they share the current VPN network namespace:
 
 ```bash
 docker compose -f compose.pia.yml up -d --force-recreate
 docker compose -f compose.pia.yml ps
 ```
-
-On the current Oracle deployment Caddy is containerized and uses
-`reverse_proxy 172.19.0.1:7777`. Set `TWITCH_M3U_BIND_IP=172.19.0.1` on Oracle
-before cutover to preserve that upstream. For local tests and Caddy running
-directly on the host, leave `TWITCH_M3U_BIND_IP=127.0.0.1`.
 
 For host-installed Caddy the configuration is:
 
