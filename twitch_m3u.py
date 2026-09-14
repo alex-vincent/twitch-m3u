@@ -536,6 +536,10 @@ def variants(master_body: str, base_url: str = "") -> list[dict]:
     return out
 
 
+def is_master(body: str) -> bool:
+    return "#EXT-X-STREAM-INF:" in body and "#EXTINF:" not in body
+
+
 def pick_variant(master_body: str, quality: str, base_url: str = "") -> str | None:
     """quality: best | worst | audio | audio_only | 720p60 | 480p | 1080 ..."""
     vs = variants(master_body, base_url)
@@ -1335,8 +1339,30 @@ class Handler(BaseHTTPRequestHandler):
         url, body = self._playlist(key, channel, quality, vod)
         if channel and in_ad_break(body):
             url, body = self._switch_player_type(key, channel, quality, url, body)
+        if channel and not self.full_proxy and is_master(body):
+            # An adaptive player picks renditions from the master itself.
+            # Point each one back here so every rendition keeps the ad-free
+            # session handling and the monotonic sequence, instead of the
+            # player fetching Twitch's playlist servers directly.
+            body = self._local_variants(body, url, channel)
         self._text(self._manifest_body(body, url, f"{key[0]}/{key[1]}"),
                    "application/vnd.apple.mpegurl")
+
+    def _local_variants(self, body: str, upstream: str, channel: str) -> str:
+        by_url = {v["url"]: v["group"] or v["name"] for v in variants(body, upstream)}
+        out = []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                group = by_url.get(urllib.parse.urljoin(upstream, stripped))
+                if group:
+                    params = {"q": group}
+                    if self.access_key:
+                        params["key"] = self.access_key
+                    line = (f"{self.base_url()}/hls/{channel}.m3u8?"
+                            + urllib.parse.urlencode(params))
+            out.append(line)
+        return "\n".join(out) + "\n"
 
     def _playlist(self, key, channel: str, quality: str, vod: str) -> tuple[str, str]:
         url = self.cache.get(key)

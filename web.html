@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Twitch</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vidstack@1.15.6/player/styles/default/theme.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vidstack@1.15.6/player/styles/default/layouts/video.css">
 <style>
   :root {
     --bg: #0e0e10; --panel: #18181b; --panel-2: #1f1f23; --line: #2a2a2e;
@@ -69,8 +71,10 @@
   #pbar .spacer { flex: 1; }
   #pbar select, #pbar button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
   #pbar button.on { border-color: var(--accent); }
-  #stage { position: relative; background: #000; min-height: 0; }
-  video { width: 100%; height: 100%; display: block; background: #000; }
+  #stage { position: relative; background: #000; min-height: 0; display: grid; }
+  media-player { width: 100%; height: 100%; --media-brand: var(--accent); --media-focus-ring-color: var(--accent);
+    --video-border: none; --video-border-radius: 0; background: #000; }
+  media-player video { width: 100%; height: 100%; object-fit: contain; }
   #status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.7);
     padding: 10px 14px; border-radius: 6px; display: none; }
   #status.on { display: block; }
@@ -109,12 +113,18 @@
     <span class="who" id="pwho"></span>
     <span class="what" id="pwhat"></span>
     <span class="spacer"></span>
-    <select id="quality" title="Quality"><option value="best">Source</option></select>
     <button id="chatbtn" title="Toggle chat">Chat</button>
     <button id="copybtn" title="Copy the stream URL for another player">Copy URL</button>
     <button id="closebtn" title="Close (Esc)">Close</button>
   </div>
-  <div id="stage"><video id="video" playsinline controls autoplay></video><div id="status"></div></div>
+  <div id="stage">
+    <media-player id="mp" stream-type="live" view-type="video" live-edge-tolerance="10" playsinline autoplay
+                  key-target="document" title="">
+      <media-provider></media-provider>
+      <media-video-layout no-audio-gain></media-video-layout>
+    </media-player>
+    <div id="status"></div>
+  </div>
   <div id="chatbox" hidden></div>
 </div>
 
@@ -128,12 +138,12 @@
   </form>
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.6.15/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vidstack@1.15.6/cdn/with-layouts/vidstack.js" type="module"></script>
 <script>
 (() => {
   'use strict';
   const $ = (s) => document.querySelector(s);
-  const state = { tab: 'top', game: null, query: '', key: '', keyRequired: false, timer: null, hls: null, login: null, quality: 'best' };
+  const state = { tab: 'top', game: null, query: '', key: '', keyRequired: false, timer: null, login: null, retry: null };
   const REFRESH_MS = 60000;
 
   // ---- access key ------------------------------------------------------
@@ -267,59 +277,62 @@
     searchTimer = setTimeout(() => { state.query = $('#search').value.trim(); load(); }, 300);
   });
 
-  // ---- player ----------------------------------------------------------
-  const video = $('#video');
+  // ---- player (Vidstack) ----------------------------------------------
+  const player = $('#mp');
   const status = (t) => { const s = $('#status'); s.textContent = t || ''; s.classList.toggle('on', !!t); };
   const streamUrl = (login, q) => withKey(`/hls/${encodeURIComponent(login)}.m3u8`, { q });
 
-  function stop() {
-    if (state.hls) { state.hls.destroy(); state.hls = null; }
-    video.removeAttribute('src'); video.load();
-  }
-
-  function start(login, quality) {
-    stop();
-    const src = streamUrl(login, quality);
-    status('Loading…');
-    if (window.Hls && Hls.isSupported()) {
-      const hls = new Hls({ lowLatencyMode: false, liveSyncDurationCount: 3, maxBufferLength: 30,
-        backBufferLength: 30, fragLoadingMaxRetry: 6, manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 6 });
-      state.hls = hls;
-      hls.on(Hls.Events.MANIFEST_PARSED, () => { status(''); video.play().catch(() => {}); });
-      hls.on(Hls.Events.FRAG_BUFFERED, () => status(''));
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        if (!data.fatal) return;
-        const code = data.response && data.response.code;
-        if (code === 404) { status('Offline'); return; }
-        status('Reconnecting…');
-        setTimeout(() => { if (state.hls === hls && state.login === login) start(login, quality); }, 3000);
-      });
-      hls.loadSource(src); hls.attachMedia(video);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = src; video.play().catch(() => {});
-      video.addEventListener('loadeddata', () => status(''), { once: true });
-    } else {
-      status('This browser cannot play HLS.');
+  // Vidstack drives hls.js itself; pin the same build as before and tune it for live.
+  player.addEventListener('provider-change', (e) => {
+    const provider = e.detail;
+    if (provider && provider.type === 'hls') {
+      provider.library = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.6.15/hls.min.js';
+      provider.config = { lowLatencyMode: false, liveSyncDurationCount: 3, maxBufferLength: 30, backBufferLength: 30,
+        fragLoadingMaxRetry: 6, manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 6 };
     }
+  });
+  player.addEventListener('can-play', () => status(''));
+  player.addEventListener('playing', () => status(''));
+  player.addEventListener('waiting', () => status(''));
+  const failed = (why) => {
+    if (!state.login) return;
+    if (why === 404) { status('Offline'); return; }
+    status('Reconnecting…');
+    clearTimeout(state.retry);
+    const login = state.login;
+    state.retry = setTimeout(() => { if (state.login === login) start(login); }, 3000);
+  };
+  player.addEventListener('hls-error', (e) => {
+    const d = e.detail || {};
+    if (!d.fatal) return;
+    failed(d.response && d.response.code);
+  });
+  player.addEventListener('error', (e) => failed(e.detail && e.detail.code));
+
+  function stop() {
+    clearTimeout(state.retry);
+    player.src = '';
   }
 
-  async function play(m) {
-    state.login = m.login; state.quality = 'best';
+  function start(login) {
+    clearTimeout(state.retry);
+    status('Loading…');
+    // The master playlist: Vidstack's quality menu lists every rendition, each
+    // of which the server hands back through /hls so the ad handling applies.
+    player.src = { src: streamUrl(login, 'master'), type: 'application/x-mpegurl' };
+    player.play().catch(() => {});
+  }
+
+  function play(m) {
+    state.login = m.login;
     $('#plogo').src = m.logo || ''; $('#pwho').textContent = m.display;
     $('#pwhat').textContent = [m.game, m.title].filter(Boolean).join(' · ');
-    $('#quality').innerHTML = '<option value="best">Source</option>';
+    player.title = `${m.display}${m.title ? ' — ' + m.title : ''}`;
+    player.poster = thumb(m.login);
     $('#player').classList.add('on'); $('#player').setAttribute('aria-hidden', 'false');
     document.body.style.overflow = 'hidden';
     if ($('#player').classList.contains('chat')) loadChat();
-    start(m.login, 'best');
-    try {
-      const d = await api(`/api/qualities/${encodeURIComponent(m.login)}`);
-      if (state.login !== m.login) return;
-      const opts = d.qualities.map((q) => `<option value="${esc(q.name)}">${esc(q.name)}</option>`);
-      $('#quality').innerHTML = opts.join('') + '<option value="master">Auto (adaptive)</option>';
-      $('#quality').value = d.qualities.length ? d.qualities[0].name : 'best';
-      state.quality = $('#quality').value;
-    } catch (e) { /* keep the Source entry */ }
+    start(m.login);
   }
 
   function loadChat() {
@@ -334,20 +347,19 @@
     $('#chatbox').innerHTML = ''; document.body.style.overflow = '';
   }
 
-  $('#quality').addEventListener('change', () => { state.quality = $('#quality').value; if (state.login) start(state.login, state.quality); });
   $('#chatbtn').addEventListener('click', () => {
     const on = $('#player').classList.toggle('chat'); $('#chatbtn').classList.toggle('on', on);
     if (on) loadChat(); else { $('#chatbox').innerHTML = ''; $('#chatbox').hidden = true; }
   });
   $('#copybtn').addEventListener('click', async () => {
     if (!state.login) return;
-    const full = location.origin + streamUrl(state.login, state.quality);
+    const full = location.origin + streamUrl(state.login, 'best');
     try { await navigator.clipboard.writeText(full); $('#copybtn').textContent = 'Copied'; }
     catch (e) { prompt('Stream URL', full); }
     setTimeout(() => { $('#copybtn').textContent = 'Copy URL'; }, 1500);
   });
   $('#closebtn').addEventListener('click', close);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.login) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.login && !document.fullscreenElement) close(); });
 
   // ---- boot ------------------------------------------------------------
   (async () => {

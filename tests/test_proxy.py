@@ -523,6 +523,31 @@ class HTTPTests(unittest.TestCase):
                 r.read()
             self.assertEqual(resolve.call_count, 2)          # parked: no token churn per reload
 
+    def test_master_variants_point_back_at_the_proxy_in_default_mode(self):
+        self._fresh_player_state()
+        self.handler.full_proxy = False
+        self.handler.cache = app._Cache()
+        master_url = 'https://usher.ttvnw.net/api/channel/hls/test.m3u8?sig=s&token=t'
+        master = (b'#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID="SERVER-TIME",VALUE="1"\n'
+                  b'#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="chunked",NAME="1080p60 (source)",DEFAULT=YES\n'
+                  b'#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,VIDEO="chunked"\nhttps://euc.playlist.ttvnw.net/v1/playlist/c.m3u8\n'
+                  b'#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p60",NAME="720p60"\n'
+                  b'#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,VIDEO="720p60"\nhttps://euc.playlist.ttvnw.net/v1/playlist/7.m3u8\n')
+        with patch.object(app, 'resolve', return_value=master_url), \
+                patch.object(app, 'open_media', return_value=Response(master, master_url)):
+            with self.get('/hls/test.m3u8?q=master&key=test-key') as r:
+                body = r.read().decode()
+        uris = [l for l in body.splitlines() if l and not l.startswith('#')]
+        self.assertEqual(len(uris), 2)
+        for uri, group in zip(uris, ('chunked', '720p60')):
+            u = urllib.parse.urlparse(uri)
+            self.assertEqual((u.scheme, u.netloc, u.path), ('http', '127.0.0.1:' + str(self.server.server_port), '/hls/test.m3u8'))
+            self.assertEqual(urllib.parse.parse_qs(u.query), {'q': [group], 'key': ['test-key']})
+        self.assertIn('#EXT-X-STREAM-INF:BANDWIDTH=6000000', body)
+        self.assertIn('SERVER-TIME', body)
+        self.assertNotIn('MEDIA-SEQUENCE', body)                # master left otherwise intact
+        self.assertNotIn('playlist.ttvnw.net', body)
+
     def test_vod_never_switches_player_type(self):
         self._fresh_player_state()
         url = 'https://video.ttvnw.net/vod.m3u8'
