@@ -160,6 +160,21 @@ VLC on that device.
   means ~4 GB/hr per viewer on a free tier with a 10 TB/month cap. At that point
   a VPN back to your home network is the better answer.
 
+## 8b. A browser front end on its own hostname
+
+The same server answers browsers with a web UI. To give it a hostname of its
+own, add a DNS A record for it and a second Caddy site block pointing at the
+same upstream:
+
+```caddyfile
+twitch.example.com {
+    reverse_proxy 127.0.0.1:7777
+}
+```
+
+Then reload Caddy. Opening `https://twitch.example.com/?key=YOURKEY` once
+stores the key in that browser.
+
 ## 9. Point your app at it
 
 ```

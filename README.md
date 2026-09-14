@@ -54,6 +54,26 @@ Play something without a playlist at all:
 mpv "$(python3 twitch_m3u.py resolve caedrel -q 720p60)"
 ```
 
+## The web UI
+
+Open the server's address in a browser and you get a directory instead of a
+playlist: Top live, your `channels.txt` channels, categories with viewer
+counts, and search, each card playing in-page through the same `/hls` proxy
+(so the ad-free sessions and the sequence fix apply), with a quality picker,
+Twitch chat alongside, and a "Copy URL" for handing a stream to another
+player. The grid refreshes itself every minute, which is the point: IPTV apps
+re-read a playlist every 8-24 hours and a snapshot of who is live goes stale
+within the hour, while the page always shows the directory as it is now.
+
+The page itself and `/api/config` are served without the access key (they
+carry no secrets); everything behind them requires it, and the page asks
+once and remembers it in that browser. Visiting `/?key=YOURKEY` stores it
+and drops it from the address bar. Nothing else is needed: the UI is one
+file, `web.html`, served by the same process, with hls.js from cdnjs.
+
+The browser fetches video segments from Twitch's CDN directly unless the
+server runs in full-proxy mode.
+
 ## Getting lots of channels
 
 `channels.txt` is just your own shortlist, and the playlist hides whoever is
@@ -303,6 +323,8 @@ good for VLC/mpv on a flaky connection, bad for players that mishandle ABR.
 /vod/<video-id>.m3u8    a past broadcast
 /epg.xml?src=games      XMLTV guide: titles, viewer counts, categories
 /help                   this list
+/                       the web UI (browsers); /api/live, /api/games,
+                        /api/search, /api/qualities/<channel> behind it
 ```
 
 It binds to `127.0.0.1` only. To reach it from a TV or phone on your LAN,

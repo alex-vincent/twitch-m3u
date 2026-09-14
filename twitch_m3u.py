@@ -101,6 +101,7 @@ UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " \
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHANNELS_FILE = os.path.join(HERE, "channels.txt")
+WEB_FILE = os.path.join(HERE, "web.html")
 
 
 class TwitchError(RuntimeError):
@@ -298,10 +299,9 @@ def _pooled_request(method: str, url: str, headers: dict, timeout: float,
             resp = conn.getresponse()
         except (http.client.HTTPException, OSError):
             conn.close()
-            if not reused:
-                raise
-            # The server closed an idle pooled connection under us: one retry
-            # on a fresh connection. Nothing was streamed yet, so it is safe.
+            # Either the server closed an idle pooled connection under us, or
+            # a lossy tunnel ate a handshake. One retry on a fresh connection:
+            # nothing was streamed yet, and every request here is idempotent.
             conn = _Connection(u.hostname, u.port or 443, timeout)
             try:
                 conn.request(method, target, body=body, headers=headers)
@@ -754,6 +754,61 @@ def top_games(limit: int = 10) -> list[str]:
             if (e.get("node") or {}).get("name")][:limit]
 
 
+def top_games_meta(limit: int = 30) -> list[dict]:
+    """Top categories with viewer counts and box art, for the web UI."""
+    q = ("query{games(first:" + str(_clamp(limit, GAMES_MAX))
+         + "){edges{node{name viewersCount boxArtURL(width:144,height:192)}}}}")
+    data = _post_gql({"query": q})
+    return [{"name": n["name"], "viewers": n.get("viewersCount") or 0,
+             "box": n.get("boxArtURL") or ""}
+            for e in _edges(data, "games") for n in [e.get("node") or {}]
+            if n.get("name")][:limit]
+
+
+def search_channels(term: str, limit: int = 20) -> list[dict]:
+    """Live channels whose name matches a search term."""
+    q = ('query($q:String!,$n:Int!){searchFor(userQuery:$q,platform:"web",'
+         'target:{index:CHANNEL,limit:$n}){channels{edges{item{... on User{'
+         'login displayName profileImageURL(width:150) '
+         'stream{title viewersCount createdAt game{name}}}}}}}}')
+    data = _post_gql({"query": q, "variables": {"q": term, "n": _clamp(limit, 50)}})
+    out = []
+    for edge in ((((data.get("data") or {}).get("searchFor") or {})
+                  .get("channels") or {}).get("edges") or []):
+        u = edge.get("item") or {}
+        st = u.get("stream")
+        if not u.get("login") or not st:
+            continue
+        out.append({
+            "login": u["login"].lower(), "display": u.get("displayName") or u["login"],
+            "logo": u.get("profileImageURL") or "", "live": True,
+            "title": (st.get("title") or "").strip(),
+            "game": ((st.get("game") or {}) or {}).get("name") or "",
+            "viewers": st.get("viewersCount") or 0, "started": st.get("createdAt") or "",
+        })
+    return out
+
+
+_QUALITIES: "_Cache | None" = None
+
+
+def channel_qualities(channel: str) -> list[dict]:
+    """The renditions a channel offers right now, highest bitrate first."""
+    global _QUALITIES
+    if _QUALITIES is None:
+        _QUALITIES = _Cache(ttl=300.0)
+    hit = _QUALITIES.get(channel)
+    if hit is not None:
+        return hit
+    url, body = master_playlist(channel)
+    out = [{"name": v["name"], "resolution": v.get("resolution") or "",
+            "bandwidth": v.get("bandwidth") or 0}
+           for v in sorted(variants(body, url), key=lambda v: -(v.get("bandwidth") or 0))
+           if v.get("name")]
+    _QUALITIES.put(channel, out)
+    return out
+
+
 def search_categories(term: str, limit: int = SEARCH_MAX) -> list[str]:
     """Category names matching a search term (100 per term)."""
     q = ('query($t:String!){searchCategories(query:$t,first:'
@@ -1131,13 +1186,25 @@ class Handler(BaseHTTPRequestHandler):
                    or [self.default_quality])[0]
         path = u.path
 
-        if self.access_key:
+        # A browser pointed at the bare host gets the web UI; a player gets a
+        # playlist (IPTV apps happily parse a page into one junk channel a
+        # line). The UI shell and its config carry no secrets, so they are
+        # the only things served without the key: the API and streams behind
+        # them still need it, and the page asks for it.
+        wants_html = "text/html" in (self.headers.get("Accept") or "")
+        public = (path in ("/", "/index.html") and wants_html) or path == "/api/config"
+
+        if self.access_key and not public:
             supplied = (qs.get("key") or [""])[0]
             if not hmac.compare_digest(supplied.encode(), self.access_key.encode()):
                 self.send_error(403, "missing or bad ?key=")
                 return
 
         try:
+            if public and path != "/api/config":
+                return self._web()
+            if path.startswith("/api/"):
+                return self._api(path, qs)
             if path == "/media":
                 if not self.full_proxy:
                     self.send_error(404)
@@ -1148,11 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_error(403, "invalid media link")
                     return
                 return self._relay_media(url)
-            # A player pointed at the bare host must get a playlist, not prose:
-            # IPTV apps happily parse a help page into one junk channel a line.
-            wants_html = "text/html" in (self.headers.get("Accept") or "")
-            if path in ("/", "/index.html", "/help") and (
-                    wants_html or path == "/help"):
+            if path == "/help":
                 return self._text(self._help())
 
             if path in ("/", "/index.html", "/playlist.m3u8", "/playlist.m3u",
@@ -1380,6 +1443,61 @@ class Handler(BaseHTTPRequestHandler):
                 # response to a partially streamed video segment.
                 self.close_connection = True
 
+    def _web(self):
+        try:
+            with open(WEB_FILE, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return self._text(self._help())
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Robots-Tag", "noindex")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _json(self, obj):
+        raw = json.dumps(obj, separators=(",", ":")).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _api(self, path: str, qs: dict):
+        """JSON for the web UI: the same channel sets the playlists use."""
+        if path == "/api/config":
+            return self._json({"key_required": bool(self.access_key),
+                               "full_proxy": self.full_proxy})
+        if path == "/api/live":
+            src = (qs.get("src") or ["top"])[0]
+            if src == "game":
+                name = (qs.get("name") or [""])[0]
+                if not name:
+                    return self.send_error(400, "name= required")
+                metas = self._channel_set("/game/" + urllib.parse.quote(name), qs)
+            elif src in ("following", "playlist", "mine"):
+                metas = self._channel_set("/playlist", qs)
+            elif src in ("top", "games"):
+                metas = self._channel_set("/" + src, qs)
+            else:
+                return self.send_error(400, "unknown src")
+            return self._json({"channels": [m for m in metas if m.get("live", True)]})
+        if path == "/api/games":
+            return self._json({"games": top_games_meta(_int(qs, "n", 30))})
+        if path == "/api/search":
+            term = (qs.get("q") or [""])[0].strip()
+            if not term:
+                return self._json({"channels": [], "games": []})
+            return self._json({"channels": search_channels(term),
+                               "games": search_categories(term, 12)})
+        m = re.fullmatch(r"/api/qualities/([A-Za-z0-9_]{2,30})", path)
+        if m:
+            return self._json({"qualities": channel_qualities(m.group(1).lower())})
+        self.send_error(404, "unknown API path")
+
     def _channel_set(self, path: str, qs: dict) -> list[dict]:
         """The exact channels a given playlist path represents."""
         how = (qs.get("sort") or ["viewers"])[0]
@@ -1483,7 +1601,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _help(self) -> str:
         h, p = self.server.server_address[0], self.server.server_address[1]
-        return (f"twitch_m3u redirect server  (this page: /help)\n\n"
+        return (f"twitch_m3u redirect server  (this page: /help)\n"
+                f"  open http://{h}:{p}/ in a browser for the web UI\n\n"
                 f"  http://{h}:{p}/                     same as below — a "
                 f"player can use the bare host\n"
                 f"  http://{h}:{p}/playlist.m3u8        live channels from "

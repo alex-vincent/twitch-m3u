@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY twitch_m3u.py channels.txt ./
+COPY twitch_m3u.py web.html channels.txt ./
 USER 65532:65532
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 EXPOSE 7777

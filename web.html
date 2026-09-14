@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Twitch</title>
+<style>
+  :root {
+    --bg: #0e0e10; --panel: #18181b; --panel-2: #1f1f23; --line: #2a2a2e;
+    --text: #efeff1; --muted: #adadb8; --accent: #9147ff; --accent-2: #772ce8;
+    --live: #eb0400; --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  a { color: inherit; text-decoration: none; }
+  button, select, input { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  header { position: sticky; top: 0; z-index: 5; display: flex; gap: 12px; align-items: center;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; display: flex; align-items: center; gap: 8px; }
+  header h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); display: inline-block; }
+  nav { display: flex; gap: 4px; }
+  nav button { background: transparent; border: 0; padding: 6px 10px; border-radius: 6px; color: var(--muted); }
+  nav button.on { background: var(--panel-2); color: var(--text); }
+  nav button:hover { color: var(--text); }
+  #search { margin-left: auto; width: min(360px, 40vw); padding: 7px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--bg); outline: none; }
+  #search:focus { border-color: var(--accent); }
+  main { padding: 16px; max-width: 1600px; margin: 0 auto; }
+  .row-title { display: flex; align-items: baseline; gap: 10px; margin: 8px 0 12px; }
+  .row-title h2 { font-size: 15px; margin: 0; }
+  .row-title .muted { color: var(--muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border-radius: var(--radius); overflow: hidden; cursor: pointer;
+    border: 1px solid transparent; transition: transform .08s ease, border-color .08s ease; }
+  .card:hover { transform: translateY(-2px); border-color: var(--accent-2); }
+  .thumb { position: relative; aspect-ratio: 16 / 9; background: #000; }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .badge { position: absolute; left: 8px; top: 8px; background: var(--live); color: #fff; font-size: 11px;
+    font-weight: 600; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+  .viewers { position: absolute; left: 8px; bottom: 8px; background: rgba(0,0,0,.7); color: #fff;
+    font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+  .meta { display: flex; gap: 10px; padding: 10px; }
+  .meta img { width: 36px; height: 36px; border-radius: 50%; flex: none; background: var(--panel-2); }
+  .meta .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .meta .s { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cats { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; }
+  .cat { background: var(--panel); border-radius: var(--radius); overflow: hidden; cursor: pointer; border: 1px solid transparent; }
+  .cat:hover { border-color: var(--accent-2); }
+  .cat img { width: 100%; aspect-ratio: 3 / 4; object-fit: cover; display: block; background: var(--panel-2); }
+  .cat .n { padding: 8px; font-weight: 600; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cat .v { padding: 0 8px 8px; color: var(--muted); font-size: 12px; }
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 999px; padding: 4px 10px; font-size: 13px; color: var(--muted); }
+  .chip button { background: none; border: 0; color: var(--muted); padding: 0 2px; }
+
+  /* player */
+  #player { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: none; grid-template-rows: auto 1fr; }
+  #player.on { display: grid; }
+  #player.chat { grid-template-columns: 1fr 340px; }
+  #player.chat #pbar { grid-column: 1 / -1; }
+  #pbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #pbar img { width: 32px; height: 32px; border-radius: 50%; }
+  #pbar .who { font-weight: 700; }
+  #pbar .what { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
+  #pbar .spacer { flex: 1; }
+  #pbar select, #pbar button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  #pbar button.on { border-color: var(--accent); }
+  #stage { position: relative; background: #000; min-height: 0; }
+  video { width: 100%; height: 100%; display: block; background: #000; }
+  #status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.7);
+    padding: 10px 14px; border-radius: 6px; display: none; }
+  #status.on { display: block; }
+  #chatbox { border-left: 1px solid var(--line); background: var(--panel); min-height: 0; }
+  #chatbox iframe { width: 100%; height: 100%; border: 0; }
+  @media (max-width: 900px) { #player.chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr 40vh; }
+    #chatbox { border-left: 0; border-top: 1px solid var(--line); } }
+
+  /* key gate */
+  #gate { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.85); display: none; place-items: center; }
+  #gate.on { display: grid; }
+  #gate form { background: var(--panel); padding: 24px; border-radius: 10px; width: min(420px, 92vw); display: grid; gap: 10px; }
+  #gate input { padding: 9px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); }
+  #gate button { background: var(--accent); border: 0; color: #fff; padding: 9px; border-radius: 6px; font-weight: 600; }
+  #gate .err { color: #ff8080; font-size: 13px; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot"></span>Twitch</h1>
+  <nav>
+    <button data-tab="following">Following</button>
+    <button data-tab="top" class="on">Top</button>
+    <button data-tab="categories">Categories</button>
+  </nav>
+  <input id="search" type="search" placeholder="Search channels and categories" autocomplete="off">
+</header>
+<main>
+  <div class="row-title"><h2 id="title">Top live</h2><span class="muted" id="subtitle"></span></div>
+  <div id="content" class="grid"></div>
+</main>
+
+<div id="player" aria-hidden="true">
+  <div id="pbar">
+    <img id="plogo" alt="">
+    <span class="who" id="pwho"></span>
+    <span class="what" id="pwhat"></span>
+    <span class="spacer"></span>
+    <select id="quality" title="Quality"><option value="best">Source</option></select>
+    <button id="chatbtn" title="Toggle chat">Chat</button>
+    <button id="copybtn" title="Copy the stream URL for another player">Copy URL</button>
+    <button id="closebtn" title="Close (Esc)">Close</button>
+  </div>
+  <div id="stage"><video id="video" playsinline controls autoplay></video><div id="status"></div></div>
+  <div id="chatbox" hidden></div>
+</div>
+
+<div id="gate">
+  <form id="gateform">
+    <strong>Access key</strong>
+    <span class="muted">This server requires the key from your <code>.env</code> (<code>TWITCH_M3U_KEY</code>). It is stored only in this browser.</span>
+    <input id="keyinput" type="password" placeholder="key" autocomplete="off">
+    <span class="err" id="gateerr"></span>
+    <button type="submit">Continue</button>
+  </form>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.6.15/hls.min.js"></script>
+<script>
+(() => {
+  'use strict';
+  const $ = (s) => document.querySelector(s);
+  const state = { tab: 'top', game: null, query: '', key: '', keyRequired: false, timer: null, hls: null, login: null, quality: 'best' };
+  const REFRESH_MS = 60000;
+
+  // ---- access key ------------------------------------------------------
+  const url = new URL(location.href);
+  if (url.searchParams.get('key')) {
+    try { localStorage.setItem('twitch_m3u_key', url.searchParams.get('key')); } catch (e) {}
+    url.searchParams.delete('key'); history.replaceState(null, '', url);
+  }
+  try { state.key = localStorage.getItem('twitch_m3u_key') || ''; } catch (e) {}
+
+  const withKey = (path, params = {}) => {
+    const u = new URL(path, location.origin);
+    for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, v);
+    if (state.key) u.searchParams.set('key', state.key);
+    return u.pathname + u.search;
+  };
+
+  async function api(path, params, attempt = 0) {
+    const r = await fetch(withKey(path, params), { cache: 'no-store' });
+    if (r.status === 403) { gate(state.key ? 'That key was refused.' : ''); throw new Error('forbidden'); }
+    if (!r.ok) {
+      // The server answers 503 when the tunnel drops a request; one retry covers most of them.
+      if (r.status >= 500 && attempt < 1) { await new Promise((res) => setTimeout(res, 1500)); return api(path, params, attempt + 1); }
+      throw new Error('HTTP ' + r.status);
+    }
+    return r.json();
+  }
+
+  function gate(msg) {
+    $('#gateerr').textContent = msg || '';
+    $('#gate').classList.add('on');
+    setTimeout(() => $('#keyinput').focus(), 0);
+  }
+  $('#gateform').addEventListener('submit', (e) => {
+    e.preventDefault();
+    state.key = $('#keyinput').value.trim();
+    try { localStorage.setItem('twitch_m3u_key', state.key); } catch (err) {}
+    $('#gate').classList.remove('on');
+    load();
+  });
+
+  // ---- rendering -------------------------------------------------------
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const human = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + 'K' : String(n);
+  const thumb = (login) => `https://static-cdn.jtvnw.net/previews-ttv/live_user_${encodeURIComponent(login)}-440x248.jpg?t=${Math.floor(Date.now() / 60000)}`;
+  const uptime = (iso) => { if (!iso) return ''; const m = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 60000)); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`; };
+
+  function renderChannels(list, emptyText) {
+    const c = $('#content'); c.className = 'grid';
+    if (!list.length) { c.innerHTML = `<div class="empty">${esc(emptyText || 'Nobody is live.')}</div>`; return; }
+    c.innerHTML = list.map((m) => `
+      <div class="card" data-login="${esc(m.login)}" title="${esc(m.title)}">
+        <div class="thumb"><img loading="lazy" src="${thumb(m.login)}" alt="">
+          <span class="badge">Live</span><span class="viewers">${human(m.viewers)} viewers · ${esc(uptime(m.started))}</span></div>
+        <div class="meta">${m.logo ? `<img loading="lazy" src="${esc(m.logo)}" alt="">` : '<img alt="">'}
+          <div style="min-width:0"><div class="t">${esc(m.title || m.display)}</div>
+          <div class="s">${esc(m.display)}</div><div class="s">${esc(m.game)}</div></div></div>
+      </div>`).join('');
+    c.querySelectorAll('.card').forEach((el) => el.addEventListener('click', () => {
+      const m = list.find((x) => x.login === el.dataset.login); if (m) play(m);
+    }));
+  }
+
+  function renderCategories(list) {
+    const c = $('#content'); c.className = 'cats';
+    c.innerHTML = list.map((g) => `
+      <div class="cat" data-name="${esc(g.name)}">${g.box ? `<img loading="lazy" src="${esc(g.box)}" alt="">` : '<img alt="">'}
+        <div class="n">${esc(g.name)}</div><div class="v">${g.viewers ? human(g.viewers) + ' viewers' : ''}</div></div>`).join('');
+    c.querySelectorAll('.cat').forEach((el) => el.addEventListener('click', () => { state.game = el.dataset.name; load(); }));
+  }
+
+  function setTitle(t, sub) { $('#title').textContent = t; $('#subtitle').textContent = sub || ''; }
+
+  // ---- data ------------------------------------------------------------
+  let loading = 0;
+  async function load() {
+    const my = ++loading;
+    document.querySelectorAll('nav button').forEach((b) => b.classList.toggle('on', b.dataset.tab === state.tab && !state.query));
+    try {
+      if (state.query) {
+        setTitle(`Search: ${state.query}`, '');
+        const d = await api('/api/search', { q: state.query });
+        if (my !== loading) return;
+        const c = $('#content');
+        renderChannels(d.channels, 'No live channels match.');
+        if (d.games.length) {
+          const wrap = document.createElement('div'); wrap.style.gridColumn = '1 / -1'; wrap.style.display = 'flex'; wrap.style.gap = '8px'; wrap.style.flexWrap = 'wrap';
+          wrap.innerHTML = d.games.map((g) => `<span class="chip" style="cursor:pointer" data-name="${esc(g)}">${esc(g)}</span>`).join('');
+          wrap.querySelectorAll('.chip').forEach((el) => el.addEventListener('click', () => { state.query = ''; $('#search').value = ''; state.tab = 'categories'; state.game = el.dataset.name; load(); }));
+          c.prepend(wrap);
+        }
+      } else if (state.tab === 'following') {
+        setTitle('Following', 'channels.txt');
+        const d = await api('/api/live', { src: 'following' });
+        if (my !== loading) return;
+        renderChannels(d.channels, 'None of your channels are live.');
+      } else if (state.tab === 'top') {
+        setTitle('Top live', 'the directory front page');
+        const d = await api('/api/live', { src: 'top', n: 30 });
+        if (my !== loading) return;
+        renderChannels(d.channels);
+      } else if (state.game) {
+        setTitle(state.game, '');
+        const c = $('#content');
+        const d = await api('/api/live', { src: 'game', name: state.game, n: 100 });
+        if (my !== loading) return;
+        renderChannels(d.channels);
+        const back = document.createElement('div'); back.style.gridColumn = '1 / -1';
+        back.innerHTML = `<span class="chip" style="cursor:pointer">← All categories</span>`;
+        back.firstChild.addEventListener('click', () => { state.game = null; load(); });
+        c.prepend(back);
+      } else {
+        setTitle('Categories', 'by current viewers');
+        const d = await api('/api/games', { n: 60 });
+        if (my !== loading) return;
+        renderCategories(d.games);
+      }
+    } catch (e) {
+      if (e.message !== 'forbidden') { $('#content').innerHTML = `<div class="empty">Could not load: ${esc(e.message)}</div>`; }
+    }
+    clearTimeout(state.timer);
+    state.timer = setTimeout(load, REFRESH_MS);
+  }
+
+  document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
+    state.tab = b.dataset.tab; state.game = null; state.query = ''; $('#search').value = ''; load();
+  }));
+  let searchTimer;
+  $('#search').addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.query = $('#search').value.trim(); load(); }, 300);
+  });
+
+  // ---- player ----------------------------------------------------------
+  const video = $('#video');
+  const status = (t) => { const s = $('#status'); s.textContent = t || ''; s.classList.toggle('on', !!t); };
+  const streamUrl = (login, q) => withKey(`/hls/${encodeURIComponent(login)}.m3u8`, { q });
+
+  function stop() {
+    if (state.hls) { state.hls.destroy(); state.hls = null; }
+    video.removeAttribute('src'); video.load();
+  }
+
+  function start(login, quality) {
+    stop();
+    const src = streamUrl(login, quality);
+    status('Loading…');
+    if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls({ lowLatencyMode: false, liveSyncDurationCount: 3, maxBufferLength: 30,
+        backBufferLength: 30, fragLoadingMaxRetry: 6, manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 6 });
+      state.hls = hls;
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { status(''); video.play().catch(() => {}); });
+      hls.on(Hls.Events.FRAG_BUFFERED, () => status(''));
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (!data.fatal) return;
+        const code = data.response && data.response.code;
+        if (code === 404) { status('Offline'); return; }
+        status('Reconnecting…');
+        setTimeout(() => { if (state.hls === hls && state.login === login) start(login, quality); }, 3000);
+      });
+      hls.loadSource(src); hls.attachMedia(video);
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = src; video.play().catch(() => {});
+      video.addEventListener('loadeddata', () => status(''), { once: true });
+    } else {
+      status('This browser cannot play HLS.');
+    }
+  }
+
+  async function play(m) {
+    state.login = m.login; state.quality = 'best';
+    $('#plogo').src = m.logo || ''; $('#pwho').textContent = m.display;
+    $('#pwhat').textContent = [m.game, m.title].filter(Boolean).join(' · ');
+    $('#quality').innerHTML = '<option value="best">Source</option>';
+    $('#player').classList.add('on'); $('#player').setAttribute('aria-hidden', 'false');
+    document.body.style.overflow = 'hidden';
+    if ($('#player').classList.contains('chat')) loadChat();
+    start(m.login, 'best');
+    try {
+      const d = await api(`/api/qualities/${encodeURIComponent(m.login)}`);
+      if (state.login !== m.login) return;
+      const opts = d.qualities.map((q) => `<option value="${esc(q.name)}">${esc(q.name)}</option>`);
+      $('#quality').innerHTML = opts.join('') + '<option value="master">Auto (adaptive)</option>';
+      $('#quality').value = d.qualities.length ? d.qualities[0].name : 'best';
+      state.quality = $('#quality').value;
+    } catch (e) { /* keep the Source entry */ }
+  }
+
+  function loadChat() {
+    if (!state.login) return;
+    $('#chatbox').hidden = false;
+    $('#chatbox').innerHTML = `<iframe src="https://www.twitch.tv/embed/${encodeURIComponent(state.login)}/chat?darkpopout&parent=${encodeURIComponent(location.hostname)}" title="chat"></iframe>`;
+  }
+
+  function close() {
+    stop(); state.login = null;
+    $('#player').classList.remove('on'); $('#player').setAttribute('aria-hidden', 'true');
+    $('#chatbox').innerHTML = ''; document.body.style.overflow = '';
+  }
+
+  $('#quality').addEventListener('change', () => { state.quality = $('#quality').value; if (state.login) start(state.login, state.quality); });
+  $('#chatbtn').addEventListener('click', () => {
+    const on = $('#player').classList.toggle('chat'); $('#chatbtn').classList.toggle('on', on);
+    if (on) loadChat(); else { $('#chatbox').innerHTML = ''; $('#chatbox').hidden = true; }
+  });
+  $('#copybtn').addEventListener('click', async () => {
+    if (!state.login) return;
+    const full = location.origin + streamUrl(state.login, state.quality);
+    try { await navigator.clipboard.writeText(full); $('#copybtn').textContent = 'Copied'; }
+    catch (e) { prompt('Stream URL', full); }
+    setTimeout(() => { $('#copybtn').textContent = 'Copy URL'; }, 1500);
+  });
+  $('#closebtn').addEventListener('click', close);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.login) close(); });
+
+  // ---- boot ------------------------------------------------------------
+  (async () => {
+    try {
+      const cfg = await fetch('/api/config', { cache: 'no-store' }).then((r) => r.json());
+      state.keyRequired = !!cfg.key_required;
+    } catch (e) {}
+    if (state.keyRequired && !state.key) { gate(''); return; }
+    load();
+  })();
+})();
+</script>
+</body>
+</html>

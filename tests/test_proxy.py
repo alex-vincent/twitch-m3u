@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import http.client
 import threading
 import unittest
@@ -145,9 +146,13 @@ class PoolTests(unittest.TestCase):
                 self.assertEqual(r.read(), b'b')
             self.assertEqual(len(fake.instances), 2)
             self.assertTrue(fake.instances[0].closed)
-        with FakeConn.install(http.client.RemoteDisconnected()):
+        with FakeConn.install(ConnectionResetError(), FakeResponse(body=b'c')) as fake:
+            with app.open_media('https://a.ttvnw.net/3') as r:
+                self.assertEqual(r.read(), b'c')             # a fresh connection is retried once too
+            self.assertEqual(len(fake.instances), 2)
+        with FakeConn.install(http.client.RemoteDisconnected(), http.client.RemoteDisconnected()):
             with self.assertRaises(http.client.HTTPException):
-                app.open_media('https://a.ttvnw.net/3')
+                app.open_media('https://a.ttvnw.net/4')         # but only once
 
     def test_redirects_are_followed_validated_and_reported_as_final_url(self):
         with FakeConn.install(FakeResponse(302, headers={'Location': '/final/master.m3u8'}),
@@ -527,6 +532,56 @@ class HTTPTests(unittest.TestCase):
                 self.assertIn('ad1.ts', r.read().decode())
             self.assertEqual(resolve.call_count, 1)
             self.assertEqual(app._PLAYER_CURSOR, {})
+
+    def test_web_shell_and_config_are_public_but_api_and_playlists_are_not(self):
+        with self.get('/', headers={'Accept': 'text/html,*/*'}) as r:
+            self.assertEqual(r.headers['Content-Type'], 'text/html; charset=utf-8')
+            self.assertIn(b'<title>Twitch</title>', r.read())
+        with self.get('/api/config') as r:
+            self.assertEqual(json.loads(r.read()), {'key_required': True, 'full_proxy': True})
+        for path in ('/', '/api/live?src=top', '/api/games', '/api/search?q=x', '/api/qualities/test'):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self.get(path)
+            self.assertEqual(ctx.exception.code, 403, path)
+        with patch.object(app, 'open_media') as fetch:
+            with self.assertRaises(urllib.error.HTTPError):
+                self.get('/api/qualities/test')
+            fetch.assert_not_called()
+
+    def test_api_live_returns_the_same_channel_sets_as_the_playlists(self):
+        meta = {'login': 'abc', 'display': 'ABC', 'logo': '', 'live': True, 'title': 't', 'game': 'g', 'viewers': 5, 'started': ''}
+        with patch.object(app, 'top_streams', return_value=[dict(meta)]) as top, \
+                patch.object(app, 'game_streams', return_value=[dict(meta, login='def')]) as game, \
+                patch.object(app, 'channel_info', return_value={'abc': dict(meta), 'off': dict(meta, login='off', live=False)}), \
+                patch.object(app, 'read_channels', return_value=['abc', 'off']):
+            self.assertEqual([c['login'] for c in json.loads(self.get('/api/live?src=top&n=5&key=test-key').read())['channels']], ['abc'])
+            self.assertEqual(top.call_args.args[0], 5)
+            self.assertEqual([c['login'] for c in json.loads(self.get('/api/live?src=game&name=Just%20Chatting&key=test-key').read())['channels']], ['def'])
+            self.assertEqual(game.call_args.args[0], 'Just Chatting')
+            self.assertEqual([c['login'] for c in json.loads(self.get('/api/live?src=following&key=test-key').read())['channels']], ['abc'])
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.get('/api/live?src=game&key=test-key')
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_api_search_games_and_qualities(self):
+        with patch.object(app, 'search_channels', return_value=[{'login': 'xqc'}]), \
+                patch.object(app, 'search_categories', return_value=['Just Chatting']) as cats:
+            self.assertEqual(json.loads(self.get('/api/search?q=xq&key=test-key').read()), {'channels': [{'login': 'xqc'}], 'games': ['Just Chatting']})
+            self.assertEqual(cats.call_args.args, ('xq', 12))
+            self.assertEqual(json.loads(self.get('/api/search?q=&key=test-key').read()), {'channels': [], 'games': []})
+        with patch.object(app, '_post_gql', return_value={'data': {'games': {'edges': [{'node': {'name': 'G', 'viewersCount': 9, 'boxArtURL': 'https://b/x.jpg'}}]}}}):
+            self.assertEqual(json.loads(self.get('/api/games?key=test-key').read()), {'games': [{'name': 'G', 'viewers': 9, 'box': 'https://b/x.jpg'}]})
+        master = ('#EXTM3U\n#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="chunked",NAME="1080p60 (source)"\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,VIDEO="chunked"\nhttps://a.ttvnw.net/c.m3u8\n'
+                  '#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="720p60",NAME="720p60"\n'
+                  '#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1280x720,VIDEO="720p60"\nhttps://a.ttvnw.net/7.m3u8\n')
+        app._QUALITIES = None
+        with patch.object(app, 'master_playlist', return_value=('https://usher.ttvnw.net/m.m3u8', master)) as mp:
+            q = json.loads(self.get('/api/qualities/Test?key=test-key').read())['qualities']
+            self.assertEqual([x['name'] for x in q], ['1080p60 (source)', '720p60'])
+            self.assertEqual(q[0]['resolution'], '1920x1080')
+            self.get('/api/qualities/test?key=test-key').read()
+            self.assertEqual(mp.call_count, 1)                    # cached, one session minted
 
     def test_default_mode_keeps_legacy_redirect(self):
         self.handler.full_proxy = False
