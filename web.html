@@ -75,10 +75,15 @@
   #pbar .spacer { flex: 1; }
   #pbar select, #pbar button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
   #pbar button.on { border-color: var(--accent); }
-  #stage { position: relative; background: #000; min-height: 0; min-width: 0; display: grid; }
-  media-player { width: 100%; height: 100%; aspect-ratio: auto; --media-brand: var(--accent); --media-focus-ring-color: var(--accent);
+  /* The stage is a fixed box and the player, provider and video are pinned to
+     it, so the picture is letterboxed (object-fit: contain) instead of the
+     video's own 16:9 height growing past the bottom of a wide window. */
+  #stage { position: relative; background: #000; min-height: 0; min-width: 0; overflow: hidden; }
+  #stage media-player { position: absolute; inset: 0; width: auto; height: auto; aspect-ratio: auto;
+    --media-brand: var(--accent); --media-focus-ring-color: var(--accent);
     --video-border: none; --video-border-radius: 0; background: #000; }
-  media-player video { width: 100%; height: 100%; object-fit: contain; }
+  #stage media-provider { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #stage media-player video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
   #status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.7);
     padding: 10px 14px; border-radius: 6px; display: none; }
   #status.on { display: block; }
