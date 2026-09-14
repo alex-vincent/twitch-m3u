@@ -60,9 +60,13 @@
   .chip button { background: none; border: 0; color: var(--muted); padding: 0 2px; }
 
   /* player */
-  #player { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: none; grid-template-rows: auto 1fr; }
+  /* minmax(0, 1fr): a plain 1fr track will not shrink below its content's
+     min-content width, and Vidstack gives the player a 16:9 aspect ratio, so
+     at full height the column forced the overlay wider than the viewport. */
+  #player { position: fixed; inset: 0; z-index: 20; background: var(--bg); display: none;
+    grid-template-rows: auto minmax(0, 1fr); grid-template-columns: minmax(0, 1fr); }
   #player.on { display: grid; }
-  #player.chat { grid-template-columns: 1fr 340px; }
+  #player.chat { grid-template-columns: minmax(0, 1fr) 340px; }
   #player.chat #pbar { grid-column: 1 / -1; }
   #pbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
   #pbar img { width: 32px; height: 32px; border-radius: 50%; }
@@ -71,8 +75,8 @@
   #pbar .spacer { flex: 1; }
   #pbar select, #pbar button { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
   #pbar button.on { border-color: var(--accent); }
-  #stage { position: relative; background: #000; min-height: 0; display: grid; }
-  media-player { width: 100%; height: 100%; --media-brand: var(--accent); --media-focus-ring-color: var(--accent);
+  #stage { position: relative; background: #000; min-height: 0; min-width: 0; display: grid; }
+  media-player { width: 100%; height: 100%; aspect-ratio: auto; --media-brand: var(--accent); --media-focus-ring-color: var(--accent);
     --video-border: none; --video-border-radius: 0; background: #000; }
   media-player video { width: 100%; height: 100%; object-fit: contain; }
   #status { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,.7);
@@ -80,7 +84,7 @@
   #status.on { display: block; }
   #chatbox { border-left: 1px solid var(--line); background: var(--panel); min-height: 0; }
   #chatbox iframe { width: 100%; height: 100%; border: 0; }
-  @media (max-width: 900px) { #player.chat { grid-template-columns: 1fr; grid-template-rows: auto 1fr 40vh; }
+  @media (max-width: 900px) { #player.chat { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) 40vh; }
     #chatbox { border-left: 0; border-top: 1px solid var(--line); } }
 
   /* key gate */
@@ -287,8 +291,12 @@
     const provider = e.detail;
     if (provider && provider.type === 'hls') {
       provider.library = 'https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.6.15/hls.min.js';
+      // hls.js assumes 500 kbit/s until it has measured, so the first seconds
+      // came from the 160p rung. Assume a fast link instead: Auto still steps
+      // down if the measurement disagrees.
       provider.config = { lowLatencyMode: false, liveSyncDurationCount: 3, maxBufferLength: 30, backBufferLength: 30,
-        fragLoadingMaxRetry: 6, manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 6 };
+        fragLoadingMaxRetry: 6, manifestLoadingMaxRetry: 6, levelLoadingMaxRetry: 6,
+        abrEwmaDefaultEstimate: 10_000_000, abrEwmaDefaultEstimateMax: 20_000_000, startLevel: -1, capLevelToPlayerSize: false };
     }
   });
   player.addEventListener('can-play', () => status(''));
